@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pandas
+openpyxl            # 处理 Excel
+python-docx         # 处理 Word
+python-dotenv       # 读取 .env
+langchain
+langchain-openai    # 或者 langchain-anthropic / langchain-community
+langchain-core
+pydantic
