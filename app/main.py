@@ -1,116 +1,106 @@
 import sys
 import os
 import pandas as pd
-from functools import partial
+import plotly.io as pio
 
-# 路径 hack
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.utils.generator import create_complex_test_excel
+from app.utils.generator import create_multi_file_test_data
 from app.services.ingestion import load_file
-from app.services.cleaner import (
-    create_cleaning_graph, 
-    analyst_node, 
-    execution_node, 
-    should_continue, 
-    AgentState, 
-    END
-)
-from langgraph.graph import StateGraph
+from app.services.workflow import create_workflow
 
 def main():
-    print("="*60)
-    print("🤖 Agentic Data Analyst - Bootstrapping")
-    print("="*60)
+    print("="*50)
+    print("🤖 Multi-File Agentic Analyst")
+    print("="*50)
+
+    # 1. 生成并加载多个文件
+    file_paths = create_multi_file_test_data()
+    
+    # 构建 Data Context: {'sales.xlsx': df1, 'products.xlsx': df2}
+    dfs_context = {}
+    print("\n🔍 Loading Files:")
+    for fp in file_paths:
+        filename = os.path.basename(fp)
+        try:
+            df = load_file(fp)
+            dfs_context[filename] = df
+            print(f"  ✅ Loaded: {filename} {df.shape}")
+        except Exception as e:
+            print(f"  ❌ Failed: {filename} - {e}")
 
     # ---------------------------------------------------------
-    # Step 0: 生成环境
+    # 🧪 场景 1: 默认 Auto EDA (多图展示)
     # ---------------------------------------------------------
-    file_path = create_complex_test_excel()
-    if not file_path:
-        return
-
-    # ---------------------------------------------------------
-    # Step 1: 智能摄入
-    # ---------------------------------------------------------
-    print("\n🔍 [Phase 1] 智能加载与感知 (Ingestion Agent)...")
-    try:
-        df = load_file(file_path)
-        print(f"\n✅ 加载完成。数据形状: {df.shape}")
-        
-    except Exception as e:
-        print(f"❌ 致命错误 (加载阶段): {e}")
-        return
-
-    # ---------------------------------------------------------
-    # Step 2: 智能清洗
-    # ---------------------------------------------------------
-    print("\n🧹 [Phase 2] 启动清洗智能体 (Cleaning Agent)...")
+    print("\n" + "-"*50)
+    print("🧪 场景 1: 用户无指令 -> 触发 Auto EDA (多图)")
+    print("-" * 50)
     
-    df_context = {"df": df}
-    
-    workflow = StateGraph(AgentState)
-    workflow.add_node("analyst", partial(analyst_node, df_context=df_context))
-    workflow.add_node("executor", partial(execution_node, df_context=df_context))
-    workflow.set_entry_point("analyst")
-    workflow.add_edge("analyst", "executor")
-    workflow.add_conditional_edges(
-        "executor",
-        should_continue,
-        {
-            "analyze": "analyst",
-            "end": END
-        }
-    )
-    
-    app = workflow.compile()
-    initial_state = {"messages": []}
-    print("⚡ Agent 正在思考与执行代码...\n")
+    app = create_workflow(dfs_context)
+    state_1 = {"messages": [], "user_instruction": "", "error_count": 0, "chart_jsons": []}
     
     try:
-        for event in app.stream(initial_state, config={"recursion_limit": 15}):
-            for node_name, state_update in event.items():
-                print(f"   ---> 节点完成: [{node_name}]")
-                if node_name == "executor" and "messages" in state_update:
-                    last_msg = state_update["messages"][-1]
-                    # 打印部分日志以便观察
-                    print(f"       📝 执行反馈: {str(last_msg.content)[:100]}...")
+        for event in app.stream(state_1, config={"recursion_limit": 25}):
+            for key, val in event.items():
+                print(f"--> Node: {key}")
+                if "router_decision" in val:
+                    print(f"    🧠 决策: {val['router_decision']}")
+                
+                if key == "executor" and "chart_jsons" in val:
+                    charts = val['chart_jsons']
+                    print(f"    🎨 生成了 {len(charts)} 张图表")
+                    # 保存所有图表
+                    for idx, c_json in enumerate(charts):
+                        pio.from_json(c_json).write_html(f"data/eda_chart_{idx+1}.html")
+                    print("    ✨ 图表已保存至 data/eda_chart_*.html")
 
     except Exception as e:
-        print(f"❌ Agent 运行出错: {e}")
-    
-    # ---------------------------------------------------------
-    # Step 3: 最终成果展示与保存 (Final Result & Save)
-    # ---------------------------------------------------------
-    print("\n" + "="*60)
-    print("🎉 任务完成！结果验证与保存:")
-    print("="*60)
-    
-    final_df = df_context['df']
-    
-    # 1. 验证：打印 Info
-    print("📊 最终数据结构:")
-    print(final_df.info())
-    
-    # 2. 验证：检查缺失值
-    missing_count = final_df.isnull().sum().sum()
-    if missing_count == 0:
-        print("\n✨ 验证通过：所有缺失值已被修复 (NaN count = 0)。")
-    else:
-        print(f"\n⚠️ 警告：仍有 {missing_count} 个缺失值未处理。")
-        print(final_df.isnull().sum())
+        print(f"Error: {e}")
 
-    # 3. 行动：保存文件 (Persistence)
-    output_filename = "cleaned_result.xlsx"
-    output_path = os.path.join("data", output_filename)
+    # ---------------------------------------------------------
+    # 🧪 场景 2: 多文件关联操作
+    # ---------------------------------------------------------
+    print("\n" + "-"*50)
+    print("🧪 场景 2: 多文件操作 (Merge)")
+    print("指令: '把销售表和产品表合并，然后画一个各类别销量的柱状图'")
+    print("-" * 50)
     
-    print(f"\n💾 正在保存文件至: {output_path} ...")
+    state_2 = {
+        "messages": [], 
+        "user_instruction": "请把 sales.xlsx 和 products.xlsx 根据产品ID合并，统计各类别的总销量，并画柱状图。", 
+        "error_count": 0,
+        "chart_jsons": []
+    }
+    
     try:
-        # 将清洗后的数据保存为 Excel
-        final_df.to_excel(output_path, index=False)
-        print(f"✅ 文件保存成功！你可以打开 'data/{output_filename}' 查看最终结果。")
+        for event in app.stream(state_2, config={"recursion_limit": 25}):
+            for key, val in event.items():
+                print(f"--> Node: {key}")
+                if key == "executor" and "chart_jsons" in val:
+                     if val['chart_jsons']:
+                        pio.from_json(val['chart_jsons'][0]).write_html("data/merge_chart.html")
+                        print("    ✨ 合并分析图表已保存: data/merge_chart.html")
     except Exception as e:
-        print(f"❌ 文件保存失败: {e}")
+        print(f"Error: {e}")
+
+    # ---------------------------------------------------------
+    # 🧪 场景 3: 无关指令 (Rejection)
+    # ---------------------------------------------------------
+    print("\n" + "-"*50)
+    print("🧪 场景 3: 无关指令 (Reject)")
+    print("指令: '给我讲个笑话'")
+    print("-" * 50)
+    
+    state_3 = {"messages": [], "user_instruction": "给我讲个笑话", "error_count": 0}
+    
+    try:
+        for event in app.stream(state_3, config={"recursion_limit": 10}):
+            for key, val in event.items():
+                print(f"--> Node: {key}")
+                if key == "general_chat":
+                    print(f"    🤖 回复: {val['messages'][0].content}")
+    except Exception as e:
+        print(f"Error: {e}")
 
 if __name__ == "__main__":
     main()
