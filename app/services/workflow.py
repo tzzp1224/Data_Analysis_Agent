@@ -6,7 +6,7 @@ import re
 import ast
 import traceback
 import json
-from typing import TypedDict, Annotated, List, Literal, Optional, Union, Dict
+from typing import TypedDict, Annotated, List, Literal, Optional, Union, Dict, Any
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -18,9 +18,8 @@ import operator
 # 0. 基础工具
 # ==========================================
 def clean_code_string(raw_content: Union[str, list, dict]) -> str:
-    """清洗代码，适配 Gemini 的各种返回格式"""
+    """清洗代码"""
     content = raw_content
-    # 处理 Gemini 可能返回的 list[part]
     if isinstance(content, list):
         text_parts = []
         for part in content:
@@ -32,8 +31,8 @@ def clean_code_string(raw_content: Union[str, list, dict]) -> str:
                 text_parts.append(part)
         content = "\n".join(text_parts)
     
-    # 尝试解析 repr 字符串
     content_str = str(content).strip()
+    # 处理 repr 字符串
     if (content_str.startswith("[") and content_str.endswith("]")) or \
        (content_str.startswith("{") and "text" in content_str):
         try:
@@ -44,8 +43,7 @@ def clean_code_string(raw_content: Union[str, list, dict]) -> str:
                 return clean_code_string(parsed.get('text', ''))
         except:
             pass
-
-    # 正则兜底
+            
     if "text:" in content_str:
         pattern = r"text:\s*(.*?)(?:,\s*extras|\})"
         match = re.search(pattern, content_str, re.DOTALL)
@@ -64,47 +62,53 @@ class AgentState(TypedDict):
     router_decision: str
     error_count: int
     chart_jsons: Annotated[List[str], operator.add]
+    # ✅ 新增：用于传递生成的 Excel 数据对象 (不直接存 DF，而是存标记，实际数据在 context 中流转)
+    # 这里我们简化：数据通过 return 字典传回，在 main 中处理
     reply: str
 
 # ==========================================
-# 2. 多文件代码执行器
+# 2. 代码执行器 (支持 result_df 捕获)
 # ==========================================
 def execute_code(dfs: Dict[str, pd.DataFrame], code: str) -> dict:
     import plotly.graph_objects as go
     import plotly.express as px
     
     local_vars = {"dfs": dfs, "pd": pd, "np": np, "px": px, "go": go}
-    
-    # 为了兼容旧习惯，如果只有一个文件，也注入 df
     if len(dfs) > 0:
-        first_key = list(dfs.keys())[0]
-        local_vars['df'] = dfs[first_key]
+        local_vars['df'] = dfs[list(dfs.keys())[0]]
 
     old_stdout = sys.stdout
     redirected_output = io.StringIO()
     sys.stdout = redirected_output
     
     captured_figs = []
+    generated_df = None # 用于存储 result_df
     
     try:
         clean_code = clean_code_string(code)
-        # 简单检查防止空代码执行
         if not clean_code: 
-            return {"success": True, "dfs": dfs, "chart_jsons": [], "log": "无代码需要执行"}
+            return {"success": True, "dfs": dfs, "chart_jsons": [], "log": "无代码", "result_df": None}
 
         exec(clean_code, {}, local_vars)
         
-        # 捕获图表
+        # 1. 捕获图表
         for var_name, var_val in local_vars.items():
-            if var_name.startswith("fig"): # 约定图表变量名以 fig 开头
-                if hasattr(var_val, "to_json"):
-                    print(f"📊 [System] 捕获图表对象: {var_name}")
-                    captured_figs.append(var_val.to_json())
+            if var_name.startswith("fig") and hasattr(var_val, "to_json"):
+                captured_figs.append(var_val.to_json())
+        
+        # 2. ✅ 核心升级：捕获 result_df
+        # 如果 LLM 生成了 result_df，说明它想输出文件
+        if "result_df" in local_vars:
+            obj = local_vars["result_df"]
+            if isinstance(obj, pd.DataFrame):
+                print("💾 [System] 捕获到结果数据: result_df")
+                generated_df = obj
         
         return {
             "success": True,
             "dfs": local_vars["dfs"],
             "chart_jsons": captured_figs,
+            "result_df": generated_df, # 返回这个对象
             "log": redirected_output.getvalue()
         }
     except Exception:
@@ -113,145 +117,120 @@ def execute_code(dfs: Dict[str, pd.DataFrame], code: str) -> dict:
             "success": False,
             "dfs": dfs,
             "chart_jsons": [],
+            "result_df": None,
             "log": f"❌ Runtime Error:\n{error_trace}"
         }
     finally:
         sys.stdout = old_stdout
 
 # ==========================================
-# 3. Nodes (节点)
+# 3. Nodes
 # ==========================================
 
 def supervisor_node(state: AgentState, dfs_context: dict):
-    """大脑节点"""
     instruction = state.get("user_instruction", "")
     messages = state.get("messages", [])
     
-    # 检查任务是否完成
     if messages:
         last_msg = messages[-1]
         if isinstance(last_msg, HumanMessage) and "WORKER_DONE" in str(last_msg.content):
             return {"router_decision": "end"}
 
-    # 默认 EDA
     if not instruction and len(messages) == 0:
         return {"router_decision": "auto_eda"}
         
     llm = get_llm(temperature=0)
-    
-    # 构建文件列表字符串
     file_list_str = ", ".join(dfs_context.keys())
     
-    # ✅ 修复点 1: 移除 f-string，改用 Prompt Template 变量传递
-    # ✅ 修复点 2: JSON 的大括号必须用 {{ }} 转义
-    system_prompt = """你是一个高级数据分析系统的指挥官。
-    当前已加载的文件: [{file_list}]
+    system_prompt = """你是一个数据操作系统的指挥官。
+    当前文件: [{file_list}]
     
-    你需要分析用户的自然语言指令，决定下一步操作：
+    根据指令决定：
+    1. 'python_worker': 需要操作数据（合并、筛选、计算、画图、输出新表格）。
+    2. 'general_chat': 无关指令。
+    3. 'end': 结束。
     
-    1. 'python_worker': 当用户想要对数据进行操作时（如：合并表格、画图、清洗、统计分析）。
-    2. 'general_chat': 当用户的指令与数据分析完全无关（如：“讲个笑话”），或者无法实现时。
-       在此模式下，拒绝并解释原因。
-    3. 'end': 任务结束。
-    
-    只返回 JSON 格式： {{ "decision": "...", "reason": "..." }}
+    返回 JSON: {{ "decision": "...", "reason": "..." }}
     """
     
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
-        ("human", "用户指令: {instruction}\n近期历史: {history}")
+        ("human", "指令: {instruction}\n历史: {history}")
     ])
     
-    history_summary = messages[-2:] if len(messages) > 2 else messages
-    
-    # ✅ 修复点 3: 在 invoke 中传入 file_list
     chain = prompt | llm | StrOutputParser()
     response = chain.invoke({
         "instruction": str(instruction), 
-        "history": str(history_summary),
+        "history": str(messages[-2:]),
         "file_list": file_list_str
     })
     
     try:
         import json
         clean_resp = clean_code_string(response)
-        # 尝试提取 json 部分 (防止 LLM 废话)
         json_match = re.search(r"\{.*\}", clean_resp, re.DOTALL)
-        if json_match:
-            clean_resp = json_match.group()
-            
+        if json_match: clean_resp = json_match.group()
         res_json = json.loads(clean_resp)
         decision = res_json.get("decision", "general_chat")
         
         if decision == "python_worker": return {"router_decision": "python_worker"}
         if decision == "general_chat": 
-            return {"router_decision": "general_chat", "reply": res_json.get("reason", "无法处理该请求")}
-            
+            return {"router_decision": "general_chat", "reply": res_json.get("reason", "无法处理")}
         return {"router_decision": "end"}
-        
-    except Exception as e:
-        print(f"Supervisor JSON Parse Error: {e}, Raw: {response}")
-        return {"router_decision": "general_chat", "reply": "指令解析失败，请重试。"}
+    except:
+        return {"router_decision": "general_chat", "reply": "指令解析失败。"}
 
 def general_chat_node(state: AgentState):
-    reply = state.get("reply", "我只能处理数据分析相关的请求。")
-    return {"messages": [AIMessage(content=reply)]}
+    return {"messages": [AIMessage(content=state.get("reply", "无法处理。"))]}
 
 def python_worker_node(state: AgentState, dfs_context: dict, mode: str = "custom"):
     dfs = dfs_context
     messages = state['messages']
     instruction = state.get('user_instruction', '')
     
-    # 构建 Schema
     schema_info = ""
     for name, df in dfs.items():
         buffer = io.StringIO()
         df.info(buf=buffer)
-        schema_info += f"\n--- File: {name} ---\n{buffer.getvalue()}\nHead:\n{df.head().to_string()}\n"
+        schema_info += f"\nFile: {name}\n{buffer.getvalue()}\nHead:\n{df.head().to_string()}\n"
     
     last_message = messages[-1] if messages else None
     error_context = ""
     if isinstance(last_message, HumanMessage) and "❌ Runtime Error" in str(last_message.content):
-        error_context = f"⚠️ 上一次代码报错:\n{last_message.content}"
+        error_context = f"⚠️ 上一次报错:\n{last_message.content}"
     
     llm = get_llm(temperature=0)
     
     if mode == "auto_eda":
         system_instructions = """
-        你是一个自动化 EDA 专家。
-        用户上传了文件但未给出指令。请编写代码对数据进行基础概览。
-        
+        用户未输入指令。请进行 Auto EDA。
         要求：
-        1. 使用 `dfs['filename']` 读取数据。**不要使用 pd.read_excel**。
-        2. 使用 Plotly (px) 绘制 **至少两张** 图表，赋值给 `fig1`, `fig2`。
-        3. 打印 "WORKER_DONE" 结束。
+        1. 使用 plotly (px) 画两张图，赋值给 fig1, fig2。
+        2. 打印 "WORKER_DONE"。
         """
-        instruction = "请进行自动 EDA 分析，生成多维度图表。"
+        instruction = "Auto EDA"
     else:
+        # ✅ 核心 Prompt 修改：强调数据处理和 result_df
         system_instructions = """
-        你是一个 Python 数据分析专家。
-        你可以通过字典 `dfs` 访问所有数据，例如 `dfs['sales.xlsx']`。
-        **不要使用 pd.read_excel / pd.read_csv 读取文件，因为数据已经在内存的 `dfs` 变量中了。**
+        你是一个 Python 数据处理专家。
+        可以通过 `dfs['filename']` 访问数据。
         
-        要求：
-        1. 根据用户指令编写 Pandas/Plotly 代码。
-        2. 如果需要合并表格，请使用 `pd.merge`。
-        3. 画图请使用 `plotly.express` (px) 并将对象赋值给 `fig` (或 fig1, fig2)。
-        4. **不要**使用 `plt.show()` 或 `fig.show()`。
-        5. 任务完成后打印 "WORKER_DONE"。
+        【核心规则】
+        1. **数据操作（合并/筛选/计算）：** 如果你生成了一个新的 DataFrame 作为最终结果（例如：合并后的表、筛选出的子表），
+           **必须**将其赋值给变量 `result_df`。
+           例如：`result_df = pd.merge(...)` 或 `result_df = df[df['id']=='P001']`。
+           
+        2. **画图：** 使用 plotly.express，赋值给 `fig`。
+        
+        3. **禁止：** - 不要使用 `to_excel` 或 `to_csv` 保存文件（由系统接管）。
+           - 不要使用 `read_excel` (直接从 dfs 读取)。
+           
+        4. **结束：** 打印 "WORKER_DONE"。
         """
 
-    # ✅ 修复点 4: 把 schema_info 作为变量传递，而不是 f-string 注入
-    # 这样可以防止 schema_info 里的 {} 干扰 Prompt Template
     prompt = ChatPromptTemplate.from_messages([
-        ("system", system_instructions + "\n只返回纯 Python 代码。"),
-        ("human", """
-        可用数据上下文:
-        {schema}
-        
-        用户指令: {instruction}
-        错误上下文: {error_context}
-        """)
+        ("system", system_instructions + "\n只返回 Python 代码。"),
+        ("human", "数据上下文:\n{schema}\n\n指令: {instruction}\n错误: {error_context}")
     ])
     
     response = (prompt | llm).invoke({
@@ -262,12 +241,9 @@ def python_worker_node(state: AgentState, dfs_context: dict, mode: str = "custom
     return {"messages": [response]}
 
 def executor_node(state: AgentState, dfs_context: dict):
-    """执行节点"""
     messages = state['messages']
-    last_ai_msg = messages[-1]
-    code = last_ai_msg.content
-    
-    print(f"\n⚡ 执行代码:\n{clean_code_string(code)[:100]}...")
+    code = messages[-1].content
+    print(f"\n⚡ 执行代码:\n{clean_code_string(code)[:80]}...")
     
     result = execute_code(dfs_context, code)
     
@@ -276,12 +252,23 @@ def executor_node(state: AgentState, dfs_context: dict):
         updates["error_count"] = 0
         if result['chart_jsons']:
             updates["chart_jsons"] = result['chart_jsons']
+        
+        # ✅ 处理结果数据
+        if result['result_df'] is not None:
+            # 我们将结果 DF 暂存入 context 的一个特殊 key，或者通过 updates 返回
+            # 为了简单，我们在 main.py 里通过监听 updates 拿不到对象（State不能存DF）
+            # 所以我们把 result_df 放入 dfs_context 的一个特殊槽位，供 Main 读取
+            dfs_context['__last_result_df__'] = result['result_df']
             
-        log = result['log']
-        if "WORKER_DONE" in log or "WORKER_DONE" in code:
-             updates["messages"] = [HumanMessage(content=f"✅ 执行成功:\n{log}\n(Signal: WORKER_DONE)")]
+            # 并在消息里标记，通知前端
+            log = result['log'] + "\n[System] 已生成结果表格 (result_df)，准备导出。"
         else:
-             updates["messages"] = [HumanMessage(content=f"✅ 执行成功:\n{log}")]
+            log = result['log']
+            
+        if "WORKER_DONE" in log or "WORKER_DONE" in code:
+             updates["messages"] = [HumanMessage(content=f"✅ 成功:\n{log}\n(Signal: WORKER_DONE)")]
+        else:
+             updates["messages"] = [HumanMessage(content=f"✅ 成功:\n{log}")]
     else:
         updates["messages"] = [HumanMessage(content=result['log'])]
         updates["error_count"] = state.get("error_count", 0) + 1
@@ -295,72 +282,35 @@ def router_logic(state: AgentState):
     decision = state.get("router_decision")
     error_count = state.get("error_count", 0)
     messages = state.get("messages", [])
-    
     if messages and error_count > 0:
         if error_count > 3: return END
         return 'python_worker'
-
     if decision == 'python_worker': return 'python_worker'
     if decision == 'auto_eda': return 'auto_eda'
     if decision == 'general_chat': return 'general_chat'
-    
     return END
 
 def executor_router(state: AgentState):
     messages = state.get("messages", [])
     if not messages: return "supervisor"
-        
-    last_msg = messages[-1]
-    content = str(last_msg.content)
-    
-    if "❌ Runtime Error" in content:
-        return "retry"
-        
-    if "WORKER_DONE" in content:
-        return "end"
-        
+    last_content = str(messages[-1].content)
+    if "❌ Runtime Error" in last_content: return "retry"
+    if "WORKER_DONE" in last_content: return "end"
     return "continue"
 
 def create_workflow(dfs_context: dict):
     from functools import partial
-    
     workflow = StateGraph(AgentState)
-    
     workflow.add_node("supervisor", partial(supervisor_node, dfs_context=dfs_context))
     workflow.add_node("general_chat", general_chat_node)
-    
     workflow.add_node("python_worker", partial(python_worker_node, dfs_context=dfs_context, mode='custom'))
     workflow.add_node("auto_eda", partial(python_worker_node, dfs_context=dfs_context, mode='auto_eda'))
-    
     workflow.add_node("executor", partial(executor_node, dfs_context=dfs_context))
     
     workflow.set_entry_point("supervisor")
-    
-    workflow.add_conditional_edges(
-        "supervisor",
-        router_logic,
-        {
-            "python_worker": "python_worker",
-            "auto_eda": "auto_eda",
-            "general_chat": "general_chat",
-            END: END
-        }
-    )
-    
+    workflow.add_conditional_edges("supervisor", router_logic, {"python_worker": "python_worker", "auto_eda": "auto_eda", "general_chat": "general_chat", END: END})
     workflow.add_edge("auto_eda", "executor")
     workflow.add_edge("python_worker", "executor")
-    
-    workflow.add_conditional_edges(
-        "executor",
-        executor_router,
-        {
-            "retry": "python_worker", 
-            "end": END,
-            "continue": "python_worker",
-            "supervisor": "supervisor"
-        }
-    )
-    
+    workflow.add_conditional_edges("executor", executor_router, {"retry": "python_worker", "end": END, "continue": "python_worker", "supervisor": "supervisor"})
     workflow.add_edge("general_chat", END)
-    
     return workflow.compile()

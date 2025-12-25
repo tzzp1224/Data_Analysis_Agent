@@ -11,94 +11,56 @@ from app.services.workflow import create_workflow
 
 def main():
     print("="*50)
-    print("🤖 Multi-File Agentic Analyst")
+    print("🤖 Agentic ETL Analyst (Excel Output Mode)")
     print("="*50)
 
-    # 1. 生成并加载多个文件
+    # 1. 生成并加载
     file_paths = create_multi_file_test_data()
-    
-    # 构建 Data Context: {'sales.xlsx': df1, 'products.xlsx': df2}
     dfs_context = {}
-    print("\n🔍 Loading Files:")
     for fp in file_paths:
-        filename = os.path.basename(fp)
-        try:
-            df = load_file(fp)
-            dfs_context[filename] = df
-            print(f"  ✅ Loaded: {filename} {df.shape}")
-        except Exception as e:
-            print(f"  ❌ Failed: {filename} - {e}")
+        dfs_context[os.path.basename(fp)] = load_file(fp)
 
     # ---------------------------------------------------------
-    # 🧪 场景 1: 默认 Auto EDA (多图展示)
+    # 🧪 场景: 筛选 + 输出文件
     # ---------------------------------------------------------
+    instruction = "请筛选出所有编号为a001的销量，输出为新表格"
+    
     print("\n" + "-"*50)
-    print("🧪 场景 1: 用户无指令 -> 触发 Auto EDA (多图)")
+    print(f"🧪 指令: {instruction}")
     print("-" * 50)
     
     app = create_workflow(dfs_context)
-    state_1 = {"messages": [], "user_instruction": "", "error_count": 0, "chart_jsons": []}
-    
-    try:
-        for event in app.stream(state_1, config={"recursion_limit": 25}):
-            for key, val in event.items():
-                print(f"--> Node: {key}")
-                if "router_decision" in val:
-                    print(f"    🧠 决策: {val['router_decision']}")
-                
-                if key == "executor" and "chart_jsons" in val:
-                    charts = val['chart_jsons']
-                    print(f"    🎨 生成了 {len(charts)} 张图表")
-                    # 保存所有图表
-                    for idx, c_json in enumerate(charts):
-                        pio.from_json(c_json).write_html(f"data/eda_chart_{idx+1}.html")
-                    print("    ✨ 图表已保存至 data/eda_chart_*.html")
-
-    except Exception as e:
-        print(f"Error: {e}")
-
-    # ---------------------------------------------------------
-    # 🧪 场景 2: 多文件关联操作
-    # ---------------------------------------------------------
-    print("\n" + "-"*50)
-    print("🧪 场景 2: 多文件操作 (Merge)")
-    print("指令: '把销售表和产品表合并，然后画一个各类别销量的柱状图'")
-    print("-" * 50)
-    
-    state_2 = {
+    state = {
         "messages": [], 
-        "user_instruction": "请把 sales.xlsx 和 products.xlsx 根据产品ID合并，统计各类别的总销量，并画柱状图。", 
+        "user_instruction": instruction, 
         "error_count": 0,
         "chart_jsons": []
     }
     
+    # 清理掉可能存在的旧结果
+    if '__last_result_df__' in dfs_context:
+        del dfs_context['__last_result_df__']
+    
     try:
-        for event in app.stream(state_2, config={"recursion_limit": 25}):
+        for event in app.stream(state, config={"recursion_limit": 25}):
             for key, val in event.items():
                 print(f"--> Node: {key}")
-                if key == "executor" and "chart_jsons" in val:
-                     if val['chart_jsons']:
-                        pio.from_json(val['chart_jsons'][0]).write_html("data/merge_chart.html")
-                        print("    ✨ 合并分析图表已保存: data/merge_chart.html")
-    except Exception as e:
-        print(f"Error: {e}")
+                
+                if key == "executor":
+                    # 1. 打印文本日志
+                    if "messages" in val:
+                        print(f"    📝 Log: {val['messages'][-1].content[:100]}...")
+                    
+                    # 2. 检查是否有文件输出信号
+                    # 我们检查 dfs_context 中是否有被写入 __last_result_df__
+                    if '__last_result_df__' in dfs_context:
+                        result_df = dfs_context.pop('__last_result_df__') # 取出并删除，防止重复
+                        
+                        output_path = "data/output_result.xlsx"
+                        print(f"    💾 [System] 检测到结果表格，正在保存至 {output_path}...")
+                        result_df.to_excel(output_path, index=False)
+                        print(f"    ✅ 文件保存成功! Rows: {len(result_df)}")
 
-    # ---------------------------------------------------------
-    # 🧪 场景 3: 无关指令 (Rejection)
-    # ---------------------------------------------------------
-    print("\n" + "-"*50)
-    print("🧪 场景 3: 无关指令 (Reject)")
-    print("指令: '给我讲个笑话'")
-    print("-" * 50)
-    
-    state_3 = {"messages": [], "user_instruction": "给我讲个笑话", "error_count": 0}
-    
-    try:
-        for event in app.stream(state_3, config={"recursion_limit": 10}):
-            for key, val in event.items():
-                print(f"--> Node: {key}")
-                if key == "general_chat":
-                    print(f"    🤖 回复: {val['messages'][0].content}")
     except Exception as e:
         print(f"Error: {e}")
 
