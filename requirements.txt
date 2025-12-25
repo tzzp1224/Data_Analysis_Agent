@@ -10,3 +10,7 @@ langchain-core
 pydantic
 langgraph
 plotly
+rapidfuzz 
+openpyxl
+sentence-transformers 
+torch

@@ -8,6 +8,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional
+from app.utils.tools import AuditLogger, smart_merge
 
 # 引入我们的核心逻辑
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -15,6 +16,24 @@ from app.services.ingestion import load_file
 from app.services.workflow import create_workflow
 
 app = FastAPI(title="Agentic Data Analyst API")
+
+
+def save_result_with_audit(result_df: pd.DataFrame, audit: AuditLogger, output_path: str):
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        # 1. 写入主要结果
+        result_df.to_excel(writer, sheet_name='分析结果', index=False)
+        
+        # 2. 写入审计日志
+        if audit:
+            log_df = audit.get_log_df()
+            if not log_df.empty:
+                log_df.to_excel(writer, sheet_name='处理日志(Audit)', index=False)
+            
+            # 3. 写入被剔除的数据 (每个 Step 一个 Sheet，或者合并)
+            for name, ex_df in audit.excluded_data.items():
+                # Sheet 名长度限制 31 字符
+                sheet_name = f"剔除_{name}"[:30]
+                ex_df.to_excel(writer, sheet_name=sheet_name, index=False)
 
 # ==========================================
 # Session Management (内存存储，重启后丢失)
@@ -147,13 +166,30 @@ async def chat(request: ChatRequest):
                     pass
 
         # 检查是否有文件生成
+        # 检查是否有文件生成
         if '__last_result_df__' in session.dfs_context:
             result_df = session.dfs_context.pop('__last_result_df__')
+            
+            # ✅ 获取 Audit 对象
+            audit_logger = session.dfs_context.pop('__last_audit__', None)
+            
             filename = f"result_{uuid.uuid4().hex[:8]}.xlsx"
             file_path = os.path.join(OUTPUT_DIR, filename)
-            result_df.to_excel(file_path, index=False)
-            download_link = f"/download/{filename}"
-            response_text += f"\n\n💾 结果文件已生成，请点击下方链接下载。"
+            
+            # ✅ 使用新的保存函数
+            try:
+                save_result_with_audit(result_df, audit_logger, file_path)
+                download_link = f"/download/{filename}"
+                
+                # 构造回复话术
+                audit_msg = ""
+                if audit_logger:
+                    count = len(audit_logger.logs)
+                    audit_msg = f"\n📝 已生成审计日志：包含 {count} 条操作记录，请在 Excel 的‘处理日志’Sheet 中查看。"
+                
+                response_text += f"\n\n💾 结果文件已生成（含审计页）。{audit_msg}\n请点击下方链接下载。"
+            except Exception as e:
+                response_text += f"\n❌ 保存文件失败: {str(e)}"
 
     except Exception as e:
         response_text = f"系统错误: {str(e)}"

@@ -13,6 +13,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langgraph.graph import StateGraph, END
 from app.services.llm_factory import get_llm
 import operator
+from app.utils.tools import AuditLogger, smart_merge
 
 # ==========================================
 # 0. 基础工具
@@ -73,7 +74,27 @@ def execute_code(dfs: Dict[str, pd.DataFrame], code: str) -> dict:
     import plotly.graph_objects as go
     import plotly.express as px
     
-    local_vars = {"dfs": dfs, "pd": pd, "np": np, "px": px, "go": go}
+    # ✅ 1. 初始化审计记录器
+    from app.utils.tools import AuditLogger, smart_merge # 确保导入
+    audit = AuditLogger()
+    
+    # ✅ 2. 注入工具到局部变量
+    # 修复点：包装器不再传递 threshold 参数，以匹配 tools.py 的新定义
+    def smart_merge_wrapper(left, right, left_on, right_on, threshold=None):
+        # 注意：为了兼容 Agent 可能会瞎传 threshold 参数的习惯，
+        # 我们在 wrapper 定义里保留 threshold=None，但在调用真实函数时 **丢弃它**。
+        return smart_merge(left, right, left_on, right_on, logger=audit)
+
+    local_vars = {
+        "dfs": dfs, 
+        "pd": pd, 
+        "np": np, 
+        "px": px, 
+        "go": go,
+        "audit": audit,
+        "smart_merge": smart_merge_wrapper # 使用修复后的包装器
+    }
+    
     if len(dfs) > 0:
         local_vars['df'] = dfs[list(dfs.keys())[0]]
 
@@ -82,12 +103,12 @@ def execute_code(dfs: Dict[str, pd.DataFrame], code: str) -> dict:
     sys.stdout = redirected_output
     
     captured_figs = []
-    generated_df = None # 用于存储 result_df
+    generated_df = None
     
     try:
         clean_code = clean_code_string(code)
         if not clean_code: 
-            return {"success": True, "dfs": dfs, "chart_jsons": [], "log": "无代码", "result_df": None}
+            return {"success": True, "dfs": dfs, "chart_jsons": [], "log": "无代码", "result_df": None, "audit_logger": audit}
 
         exec(clean_code, {}, local_vars)
         
@@ -96,8 +117,7 @@ def execute_code(dfs: Dict[str, pd.DataFrame], code: str) -> dict:
             if var_name.startswith("fig") and hasattr(var_val, "to_json"):
                 captured_figs.append(var_val.to_json())
         
-        # 2. ✅ 核心升级：捕获 result_df
-        # 如果 LLM 生成了 result_df，说明它想输出文件
+        # 2. 捕获 result_df
         if "result_df" in local_vars:
             obj = local_vars["result_df"]
             if isinstance(obj, pd.DataFrame):
@@ -108,7 +128,8 @@ def execute_code(dfs: Dict[str, pd.DataFrame], code: str) -> dict:
             "success": True,
             "dfs": local_vars["dfs"],
             "chart_jsons": captured_figs,
-            "result_df": generated_df, # 返回这个对象
+            "result_df": generated_df,
+            "audit_logger": audit, 
             "log": redirected_output.getvalue()
         }
     except Exception:
@@ -118,6 +139,7 @@ def execute_code(dfs: Dict[str, pd.DataFrame], code: str) -> dict:
             "dfs": dfs,
             "chart_jsons": [],
             "result_df": None,
+            "audit_logger": audit, # 即使失败也返回 log
             "log": f"❌ Runtime Error:\n{error_trace}"
         }
     finally:
@@ -225,18 +247,31 @@ def python_worker_node(state: AgentState, dfs_context: dict, mode: str = "custom
     system_instructions = """
     你是一个全能型 Python 数据分析专家。你拥有对 `dfs` 字典的完全访问权限，其中包含了用户上传的所有数据表。
     
-    你的核心能力层级如下，请根据用户指令灵活调用：
-    
-    🔍 **L1: 数据清洗与预处理 (Preprocessing)**
-       - **格式统一**：使用 `pd.to_datetime`, `astype` 转换混乱的格式。
-       - **文本清洗**：使用 `.str.strip()`, `.str.replace()` 去除干扰字符。
-       - **异常处理**：使用 `fillna` 填充缺失值，或 `dropna` 删除无效行。
-       - **模糊语义**：如果用户说的列名与实际不完全一致（如 "金额" vs "Amount"），请根据语义自动推断。
+    【强大的内置工具 (Built-in Tools)】
+    你拥有以下特殊对象和函数，**请务必使用它们**来增强代码的健壮性和可信度：
+
+    1. **`audit` (审计记录器)**:
+       - 每当你执行数据清洗（删除行、填充空值）或关键计算时，**必须**记录日志。
+       - 用法1 (普通操作): `audit.info("清洗步骤", "删除了空值行", affected_rows=5)`
+       - 用法2 (剔除数据): `audit.log_exclusion("异常剔除", "销售额为负数的行", excluded_df)`
+       - **原则：不要只默默做事，要留痕！**
+
+    2. **`smart_merge` (智能模糊关联)**:
+       - 当你需要合并两张表，但怀疑 Key 列（如公司名、人名）可能存在拼写不一致时（如 '腾讯' vs '腾讯科技'），**不要用 `pd.merge`**。
+       - **请使用**: `result_df = smart_merge(df1, df2, left_on='name', right_on='comp_name')`
+       - 它会自动处理模糊匹配并记录日志。
+
+    【能力层级更新】
+    🔍 **L1: 数据清洗**
+       - 遇到异常值，先筛选出来：`bad_rows = df[df['age'] < 0]`
+       - 记录审计：`audit.log_exclusion("年龄清洗", "剔除负数年龄", bad_rows)`
+       - 然后剔除：`df = df[df['age'] >= 0]`
+       - **重要技巧**：在筛选子集后如果需要修改数据，请务必使用 `.copy()`，例如 `df_clean = df[df['val']>0].copy()`，以避免 SettingWithCopyWarning。
        
     🔗 **L2: 多表关联与整合 (Integration)**
-       - **关联**：使用 `pd.merge` (类似 VLOOKUP) 进行数据匹配。
-       - **追加**：使用 `pd.concat` 合并结构相同的表。
-       - **注意**：合并前请确保 Key 列的类型一致。
+       - **智能工具**：遇到 Key 列不一致（如中英文、别名、简称），**必须使用 `smart_merge`**。
+       - **能力增强**：该工具已集成 **语义向量模型 (Sentence-BERT)**，可以识别 'Tencent' <-> '腾讯', '今日头条' <-> '字节跳动' 等复杂关系，无需人工干预。
+       - **代码示例**: `result_df = smart_merge(sales_df, client_df, left_on='客户名称', right_on='标准公司名')`
        
     📊 **L3: 统计与透视 (Analysis)**
        - **聚合**：使用 `groupby`, `pivot_table` 进行多维度汇总。
@@ -332,7 +367,10 @@ def executor_node(state: AgentState, dfs_context: dict):
             # 为了简单，我们在 main.py 里通过监听 updates 拿不到对象（State不能存DF）
             # 所以我们把 result_df 放入 dfs_context 的一个特殊槽位，供 Main 读取
             dfs_context['__last_result_df__'] = result['result_df']
-            
+
+            if result.get('audit_logger'):
+                dfs_context['__last_audit__'] = result['audit_logger']
+                
             # 并在消息里标记，通知前端
             log = result['log'] + "\n[System] 已生成结果表格 (result_df)，准备导出。"
         else:
