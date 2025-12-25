@@ -8,3 +8,4 @@ langchain
 langchain-google-genai  # ✅ 核心变动：适配 Google Gemini
 langchain-core
 pydantic
+langgraph
