@@ -7,6 +7,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # ✅ 修正导入：使用新的 generator 函数名
 from app.utils.generator import create_complex_test_data
+from app.utils.finance_generator import create_reconciliation_data
 # 引入 Ingestion 组件
 from app.services.ingestion import propose_ingestion_config, apply_ingestion
 from app.services.workflow import create_workflow
@@ -54,10 +55,14 @@ def main():
     print("="*50)
 
     # 1. ✅ 调用新的生成器函数
-    file_paths = create_complex_test_data()
+    file_paths_1 = create_complex_test_data()
+    file_paths_2 = create_reconciliation_data()   # ✅ 新增：财务对账数据
+    # 合并文件列表供加载
+    all_files = file_paths_1 + file_paths_2
     
-    # 2. 交互式加载
-    dfs_context = interactive_file_loader(file_paths)
+    # 2. 交互式加载 (传入所有文件)
+    dfs_context = interactive_file_loader(all_files)
+
     
     if not dfs_context:
         print("没有数据被加载，程序退出。")

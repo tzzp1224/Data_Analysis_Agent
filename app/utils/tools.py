@@ -210,3 +210,115 @@ def smart_merge(left_df: pd.DataFrame, right_df: pd.DataFrame,
         del merged[temp_col]
         
     return merged
+
+
+def smart_reconcile(df_sys: pd.DataFrame, df_bank: pd.DataFrame, 
+                    sys_key: str, bank_key: str, 
+                    sys_amount: str, bank_amount: str, 
+                    tolerance: float = 0.01,
+                    logger: AuditLogger = None) -> pd.DataFrame:
+    """
+    智能对账工具 (Smart Reconciliation)
+    解决痛点：
+    1. 字段不统一：允许传入不同的 Key 列名。
+    2. 容差匹配：允许 tolerance 范围内的金额差异 (如 0.01 或 5元手续费)。
+    3. 状态生成：自动生成 '完全匹配', '金额差异', '单边账(系统)', '单边账(银行)'。
+    
+    注意：针对“多对一”场景，建议 Agent 在调用此函数前，先对数据进行 groupby 求和。
+    """
+    print(f"⚖️ [Reconcile] 启动对账: 系统表({len(df_sys)}) vs 银行表({len(df_bank)})")
+    
+    # 1. 预处理：确保 Key 都是字符串，去空格
+    df_sys = df_sys.copy()
+    df_bank = df_bank.copy()
+    
+    df_sys[sys_key] = df_sys[sys_key].astype(str).str.strip()
+    df_bank[bank_key] = df_bank[bank_key].astype(str).str.strip()
+    
+    # 2. 预处理：确保金额是 float
+    def clean_amount(x):
+        try:
+            return float(str(x).replace(',', '').replace('¥', '').replace('$', ''))
+        except:
+            return 0.0
+            
+    df_sys[f"_clean_{sys_amount}"] = df_sys[sys_amount].apply(clean_amount)
+    df_bank[f"_clean_{bank_amount}"] = df_bank[bank_amount].apply(clean_amount)
+    
+    # 3. 全量关联 (Outer Join) - 也就是“找差异”的基础
+    # 使用 suffix 区分同名列
+    merged = pd.merge(df_sys, df_bank, left_on=sys_key, right_on=bank_key, how='outer', indicator=True, suffixes=('_SYS', '_BANK'))
+    
+    # 4. 核心逻辑：计算差异与判定状态
+    def classify_status(row):
+        # 4.1 单边账判断
+        if row['_merge'] == 'left_only':
+            return "🔴 单边账(系统有-银行无)"
+        elif row['_merge'] == 'right_only':
+            return "🔴 单边账(银行有-系统无)"
+        
+        # 4.2 双边都有，检查金额
+        amt_sys = row.get(f"_clean_{sys_amount}", 0)
+        # 如果列名重复，pandas加了后缀，需要动态获取
+        if f"_clean_{sys_amount}" not in row:
+            amt_sys = row.get(f"_clean_{sys_amount}_SYS", 0)
+            
+        amt_bank = row.get(f"_clean_{bank_amount}", 0)
+        if f"_clean_{bank_amount}" not in row:
+            amt_bank = row.get(f"_clean_{bank_amount}_BANK", 0)
+            
+        diff = abs(amt_sys - amt_bank)
+        
+        if diff <= 1e-6: # 浮点数绝对相等
+            return "✅ 完全匹配"
+        elif diff <= tolerance:
+            return f"⚠️ 容差匹配 (差额 {diff:.2f})"
+        else:
+            return f"❌ 金额不符 (差额 {diff:.2f})"
+
+    merged['对账状态'] = merged.apply(classify_status, axis=1)
+    
+    # 5. 计算具体的差额数值 (系统 - 银行)
+    # 注意处理 NaN (单边账时其中一个为 0 或 NaN)
+    # sys_val = merged.get(f"_clean_{sys_amount}", merged.get(f"_clean_{sys_amount}_SYS", 0)).fillna(0)
+    # bank_val = merged.get(f"_clean_{bank_amount}", merged.get(f"_clean_{bank_amount}_BANK", 0)).fillna(0)
+    # merged['金额差异'] = sys_val - bank_val
+    # 1. 安全获取 Series，确保拿到的是 Pandas 对象
+    s_col = f"_clean_{sys_amount}"
+    s_col_sys = f"_clean_{sys_amount}_SYS"
+
+    # 优先取主列，没有则取带后缀的列，再没有则给全0的Series
+    if s_col in merged.columns:
+        sys_series = merged[s_col]
+    elif s_col_sys in merged.columns:
+        sys_series = merged[s_col_sys]
+    else:
+        sys_series = pd.Series(0, index=merged.index)
+
+    # 同理处理银行列
+    b_col = f"_clean_{bank_amount}"
+    b_col_bank = f"_clean_{bank_amount}_BANK"
+
+    if b_col in merged.columns:
+        bank_series = merged[b_col]
+    elif b_col_bank in merged.columns:
+        bank_series = merged[b_col_bank]
+    else:
+        bank_series = pd.Series(0, index=merged.index)
+
+    # 2. 安全计算差异
+    merged['金额差异'] = sys_series.fillna(0) - bank_series.fillna(0)   
+        
+    # 6. 清理辅助列
+    drop_cols = [c for c in merged.columns if c.startswith('_clean_') or c == '_merge']
+    merged.drop(columns=drop_cols, inplace=True)
+    
+    # 7. 审计日志
+    if logger:
+        # 统计各状态数量
+        status_counts = merged['对账状态'].value_counts().to_dict()
+        desc = "对账完成。\n" + "\n".join([f"  - {k}: {v}笔" for k, v in status_counts.items()])
+        logger.info("Smart Reconcile", desc, affected_rows=len(merged))
+        print("   📊 对账统计:\n" + desc)
+
+    return merged

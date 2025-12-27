@@ -6,6 +6,7 @@ import re
 import ast
 import traceback
 import json
+import warnings # 
 from typing import TypedDict, Annotated, List, Literal, Optional, Union, Dict, Any
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
@@ -73,18 +74,36 @@ class AgentState(TypedDict):
 def execute_code(dfs: Dict[str, pd.DataFrame], code: str) -> dict:
     import plotly.graph_objects as go
     import plotly.express as px
+    import traceback
+    import io
     
-    # ✅ 1. 初始化审计记录器
-    from app.utils.tools import AuditLogger, smart_merge # 确保导入
+    # ✅ 1. 导入所有工具 (确保 tools.py 里有 smart_reconcile)
+    from app.utils.tools import AuditLogger, smart_merge, smart_reconcile
+    
     audit = AuditLogger()
     
-    # ✅ 2. 注入工具到局部变量
-    # 修复点：包装器不再传递 threshold 参数，以匹配 tools.py 的新定义
+    # ✅ 2. 定义包装器 (Wrappers)
+    # Smart Merge 包装器
     def smart_merge_wrapper(left, right, left_on, right_on, threshold=None):
-        # 注意：为了兼容 Agent 可能会瞎传 threshold 参数的习惯，
-        # 我们在 wrapper 定义里保留 threshold=None，但在调用真实函数时 **丢弃它**。
         return smart_merge(left, right, left_on, right_on, logger=audit)
 
+    # ✅ Smart Reconcile 包装器 (关键！)
+    def smart_reconcile_wrapper(df_sys, df_bank, sys_key, bank_key, sys_amount, bank_amount, tolerance=0.01):
+        return smart_reconcile(df_sys, df_bank, sys_key, bank_key, sys_amount, bank_amount, tolerance, logger=audit)
+
+    # ✅ 新增：定义还原函数
+    def reload_data_wrapper(filename: str):
+        backup_key = f"__backup_{filename}"
+        if backup_key in dfs:
+            print(f"🔄 [System] 正在还原数据: {filename}")
+            # 从备份中恢复，并确保是深拷贝
+            dfs[filename] = dfs[backup_key].copy(deep=True)
+            return True
+        else:
+            print(f"❌ [System] 未找到备份数据: {filename}")
+            return False
+        
+    # ✅ 3. 注入到局部变量
     local_vars = {
         "dfs": dfs, 
         "pd": pd, 
@@ -92,7 +111,9 @@ def execute_code(dfs: Dict[str, pd.DataFrame], code: str) -> dict:
         "px": px, 
         "go": go,
         "audit": audit,
-        "smart_merge": smart_merge_wrapper # 使用修复后的包装器
+        "smart_merge": smart_merge_wrapper,       # L2 工具
+        "smart_reconcile": smart_reconcile_wrapper, # L3 工具 (必须注入！)
+        "reload_data": reload_data_wrapper
     }
     
     if len(dfs) > 0:
@@ -110,14 +131,18 @@ def execute_code(dfs: Dict[str, pd.DataFrame], code: str) -> dict:
         if not clean_code: 
             return {"success": True, "dfs": dfs, "chart_jsons": [], "log": "无代码", "result_df": None, "audit_logger": audit}
 
-        exec(clean_code, {}, local_vars)
+        # ✅ 修复点：强制注入屏蔽警告的代码，防止 SettingWithCopyWarning 污染控制台
+        # 这可以防止 Agent 被无害的警告迷惑，导致死循环
+        safe_code = "import warnings\nwarnings.filterwarnings('ignore')\n" + clean_code
         
-        # 1. 捕获图表
+        # 执行代码
+        exec(safe_code, {}, local_vars)
+        
+        # 捕获结果
         for var_name, var_val in local_vars.items():
             if var_name.startswith("fig") and hasattr(var_val, "to_json"):
                 captured_figs.append(var_val.to_json())
         
-        # 2. 捕获 result_df
         if "result_df" in local_vars:
             obj = local_vars["result_df"]
             if isinstance(obj, pd.DataFrame):
@@ -139,8 +164,8 @@ def execute_code(dfs: Dict[str, pd.DataFrame], code: str) -> dict:
             "dfs": dfs,
             "chart_jsons": [],
             "result_df": None,
-            "audit_logger": audit, # 即使失败也返回 log
-            "log": f"❌ Runtime Error:\n{error_trace}"
+            "audit_logger": audit,
+            "log": f"❌ Runtime Error:\n{error_trace}" # 将报错甩回给 Agent
         }
     finally:
         sys.stdout = old_stdout
@@ -153,10 +178,14 @@ def supervisor_node(state: AgentState, dfs_context: dict):
     instruction = state.get("user_instruction", "")
     messages = state.get("messages", [])
     
+    # ✅ 检查是否已完成
     if messages:
         last_msg = messages[-1]
-        if isinstance(last_msg, HumanMessage) and "WORKER_DONE" in str(last_msg.content):
-            return {"router_decision": "end"}
+        if isinstance(last_msg, HumanMessage):
+             content = str(last_msg.content)
+             # 只要检测到 WORKER_DONE 或 明确的分析结论，就结束
+             if "WORKER_DONE" in content:
+                 return {"router_decision": "end"}
 
     if not instruction and len(messages) == 0:
         return {"router_decision": "auto_eda"}
@@ -179,6 +208,10 @@ def supervisor_node(state: AgentState, dfs_context: dict):
         ("system", system_prompt),
         ("human", "指令: {instruction}\n历史: {history}")
     ])
+
+    # 简单的容错机制，防止 supervisor 死循环
+    if len(messages) > 10:
+        return {"router_decision": "end"}
     
     chain = prompt | llm | StrOutputParser()
     response = chain.invoke({
@@ -224,6 +257,7 @@ def python_worker_node(state: AgentState, dfs_context: dict, mode: str = "custom
     # 我们只给 LLM 看列名、类型和前5行，绝不传输全量数据，节省 Token
     schema_info = ""
     for name, df in dfs.items():
+        if name.startswith("__"): continue
         buffer = io.StringIO()
         df.info(buf=buffer)
         info_str = buffer.getvalue()
@@ -261,21 +295,140 @@ def python_worker_node(state: AgentState, dfs_context: dict, mode: str = "custom
        - **请使用**: `result_df = smart_merge(df1, df2, left_on='name', right_on='comp_name')`
        - 它会自动处理模糊匹配并记录日志。
 
+    3. **重置数据**：如果用户想“重新清洗”或“还原”某张表，请执行 `reload_data('文件名')`。
+      示例：`reload_data('sales_data.xlsx')`
+
+    【核心要求】
+    1. **必须导入库**：`import pandas as pd, numpy as np, re`。
+    2. **类型安全 (Crucial)**：处理字符串列（如银行卡号、身份证、电话）时，**必须先转为 string**，防止数字类型报错。
+       - ❌ 错误：`df['Card'].apply(lambda x: x[:4])` (如果 x 是 int 会报错)
+       - ✅ 正确：`df['Card'] = df['Card'].astype(str)` 然后再处理。
+       - ✅ 处理 NaN：`df['Card'] = df['Card'].fillna('')`
+    3. **任务完成标志**：代码最后一行**必须**打印 `print("WORKER_DONE")`，否则系统会认为失败并重试。
+    4. **禁止 Markdown**：只返回纯代码。
+    5. **数据操作安全**：当对筛选后的 DataFrame 进行修改时，**必须使用 .copy()**，防止 `SettingWithCopyWarning`。
+    
+    【全局原则】
+    1. **回写字典**：修改后的 DataFrame 必须赋值回 `dfs[name] = df`。
+    2. **遍历处理**：遇到“清洗”、“检查”、“了解”指令，必须遍历所有表。
+    3. **业务清洗观**：
+       - 对于**明显错误**（如价格为负、数量无限大）：执行**剔除 (Drop)** 并记录。
+       - 对于**逻辑冲突**（如 P*Q != Total）：**不要盲目修改数值**（因为不知道是单价错还是数量错），而是**保留原样或剔除**，并在审计日志中**详细记录**出问题的 ID 和具体数值，供人工核查。
+
     【能力层级更新】
-    🔍 **L1: 数据清洗**
-       - 遇到异常值，先筛选出来：`bad_rows = df[df['age'] < 0]`
-       - 记录审计：`audit.log_exclusion("年龄清洗", "剔除负数年龄", bad_rows)`
-       - 然后剔除：`df = df[df['age'] >= 0]`
-       - **重要技巧**：在筛选子集后如果需要修改数据，请务必使用 `.copy()`，例如 `df_clean = df[df['val']>0].copy()`，以避免 SettingWithCopyWarning。
+    在编写代码前，严格判断用户意图属于哪一层级：
+    🔍 **L1: 通用数据体检 (General Hygiene)**
+       - **触发**：用户问“数据体检”、“清洗数据”、“检查异常”。
+       - **策略**：
+         1. **去重与空值**：这是所有表都需要的。
+         2. **数值清洗**：尝试将所有“看起来像数字”的列转为数字（去除 ¥, 等符号）。
+         3. **异常值检测**：
+            - **负数检测**：对于名为“金额/数量/Price/Qty”的列，检测负数。
+            - **极端值检测**：检测数值是否异常巨大（如 > 10万 或 > 平均值+3倍标准差）。
+         4. **(可选) 逻辑检查**：**只有**当同时检测到 `单价`、`数量`、`总金额` 列时，才执行逻辑校验。
+       
+       - **标准代码模板 (请严格参考)**：
+         ```python
+         import numpy as np
+         import pandas as pd
+         import re
+         
+         for name, df in dfs.items():
+             print(f"\\n### 正在分析表: {{name}}") 
+             initial_count = len(df)
+             
+             # --- 1. 基础清洗 (去重) ---
+             if df.duplicated().any():
+                 dupe_count = df.duplicated().sum()
+                 print(f"- 🗑️ 剔除 {{dupe_count}} 条完全重复行")
+                 audit.log_exclusion(f"重复剔除-{{name}}", "完全重复行", df[df.duplicated()])
+                 df = df.drop_duplicates()
+
+             # --- 2. 智能数值转换 (针对所有列) ---
+             # 自动识别可能包含数字的 Object 列
+             for col in df.columns:
+                 if df[col].dtype == 'object':
+                     # 如果包含数字且不包含过多字母(排除ID)，尝试清洗
+                     sample = str(df[col].dropna().iloc[0]) if not df[col].dropna().empty else ""
+                     if re.search(r'\d', sample) and not re.search(r'[a-zA-Z]{{3,}}', sample):
+                         try:
+                             # 尝试去除非数字字符转换
+                             cleaned = df[col].astype(str).str.replace(r'[¥,]', '', regex=True)
+                             # 只有当转换成功率高时才应用，避免误伤 ID 列
+                             converted = pd.to_numeric(cleaned, errors='coerce')
+                             if converted.notna().sum() > 0:
+                                 df[col] = converted
+                         except:
+                             pass
+
+             # --- 3. 通用异常值检测 ---
+             # 仅针对数值列
+             num_cols = df.select_dtypes(include=[np.number]).columns
+             for col in num_cols:
+                 # A. 负数检测 (仅针对具备物理意义的列名)
+                 if re.search(r'(金额|价|量|Amount|Price|Qty|Count)', col, re.I):
+                     mask_neg = df[col] < 0
+                     if mask_neg.any():
+                         print(f"- ⚠️ {{col}}: 发现 {{mask_neg.sum()}} 个负数 (已记录并剔除)")
+                         audit.log_exclusion(f"负数异常-{{name}}", f"{{col}} 为负数", df[mask_neg])
+                         df = df[~mask_neg]
+                 
+                 # B. 极端值检测 (简单阈值法，比如 > 100000，或者根据分位数)
+                 # 这里使用绝对阈值示例，防止统计学误伤小样本
+                 # 仅检测“数量”或“金额”相关
+                 if re.search(r'(Qty|Count|数量)', col, re.I):
+                     mask_huge = df[col] > 100000
+                     if mask_huge.any():
+                         print(f"- ⚠️ {{col}}: 发现 {{mask_huge.sum()}} 个极端大值 (已记录并剔除)")
+                         audit.log_exclusion(f"极端值-{{name}}", f"{{col}} 过大", df[mask_huge])
+                         df = df[~mask_huge]
+
+             # --- 4. 逻辑一致性 (防御性执行) ---
+             # 只有列名完全匹配时才执行，避免误伤
+             p_col = next((c for c in df.columns if re.search(r'(单价|Price)', c, re.I)), None)
+             q_col = next((c for c in df.columns if re.search(r'(数量|Qty)', c, re.I)), None)
+             t_col = next((c for c in df.columns if re.search(r'(总金额|Total|Amount)', c, re.I)), None)
+             
+             if p_col and q_col and t_col:
+                 try:
+                     expected = df[p_col] * df[q_col]
+                     mask_logic = abs(expected - df[t_col]) > 1.0 # 容差 1.0
+                     if mask_logic.any():
+                         print(f"- ⚠️ 发现 {{mask_logic.sum()}} 条金额逻辑不符 (已记录)")
+                         # 这里我们只记录 Audit，不一定强制剔除，由用户决定，或者剔除
+                         audit.log_exclusion(f"逻辑校验失败-{{name}}", "计算逻辑不符", df[mask_logic])
+                         df = df[~mask_logic]
+                 except:
+                     pass # 如果列之间无法计算，跳过
+
+             # --- 5. 保存 ---
+             dfs[name] = df
+             print(f"- 处理后: {{len(df)}} 行")
+         
+         result_df = list(dfs.values())[0]
+         print("WORKER_DONE")
+         ```
        
     🔗 **L2: 多表关联与整合 (Integration)**
+       - **触发**：用户明确说了“合并”、“连接”、“关联表A和表B”。
+       - **工具**：只有此时才允许使用 `pd.merge` (标准Key) 或 `smart_merge` (模糊Key)。
        - **智能工具**：遇到 Key 列不一致（如中英文、别名、简称），**必须使用 `smart_merge`**。
        - **能力增强**：该工具已集成 **语义向量模型 (Sentence-BERT)**，可以识别 'Tencent' <-> '腾讯', '今日头条' <-> '字节跳动' 等复杂关系，无需人工干预。
        - **代码示例**: `result_df = smart_merge(sales_df, client_df, left_on='客户名称', right_on='标准公司名')`
-       
-    📊 **L3: 统计与透视 (Analysis)**
-       - **聚合**：使用 `groupby`, `pivot_table` 进行多维度汇总。
-       - **计算**：计算占比、增长率、统计分布。
+
+    💰 **L3: 财务对账 (Financial Reconciliation)**
+       - **触发**：用户明确说了“对账”、“核对流水”、“找两表差异”。
+       - **工具**：只有此时才允许使用 `smart_reconcile`。
+       - **核心工具**：使用 `smart_reconcile(df1, df2, key1, key2, amt1, amt2, tolerance=0.05)`。
+       - **多对一问题 (Many-to-One)**：
+         - 如果用户提到“多笔订单合并支付”或“系统多条对应银行一条”，**必须先聚合数据**！
+         - 示例：`df_sys_grouped = df_sys.groupby('外部流水号')['应收金额'].sum().reset_index()`
+         - 然后再拿聚合后的 `df_sys_grouped` 去和银行表 `smart_reconcile`。
+         **重置索引 (非常重要)**：`df_agg = df_agg.reset_index()`。
+         - ❌ 错误：直接把 GroupBy 后的 Series 传给工具。
+         - ✅ 正确：必须传 DataFrame，且 Key 必须是列名。
+         在进行 groupby 聚合后，必须 立即调用 .reset_index()，并打印 df.columns 确认列名存在，然后再传入 smart_reconcile 工具。
+       - **容差 (Tolerance)**：默认容差为 0.01。如果用户说“忽略 5 元以内差异”，请设置 `tolerance=5`。
        
     📈 **L4: 可视化与交付 (Delivery)**
        - **文件交付 (严格限制)**：
@@ -297,6 +450,8 @@ def python_worker_node(state: AgentState, dfs_context: dict, mode: str = "custom
     2. **可解释性**：在编写代码前，必须先写一段 Python 注释 (`# PLAN: ...`)，用自然语言解释你的解题思路。
     3. **结束信号**：任务完成后，必须打印 `print("WORKER_DONE")`。
     4. **禁止**：禁止使用 `to_excel` 保存文件（系统会自动接管 `result_df` 进行保存）。禁止使用 `plt.show()`。
+    5. **“模糊查询”规范**：“当用户查询某个实体（如 'Tencent'）但数据表中可能存储为中文或别名时，不要直接用 ==。请使用 df['列'].str.contains('腾讯|Tencent', case=False)，
+        或者先调用 vector_match('Tencent', df['列'].unique()) (如果你想做得更高级)。”
     """
     
     # ---------------------------------------------------------
@@ -361,25 +516,18 @@ def executor_node(state: AgentState, dfs_context: dict):
         if result['chart_jsons']:
             updates["chart_jsons"] = result['chart_jsons']
         
-        # ✅ 处理结果数据
         if result['result_df'] is not None:
-            # 我们将结果 DF 暂存入 context 的一个特殊 key，或者通过 updates 返回
-            # 为了简单，我们在 main.py 里通过监听 updates 拿不到对象（State不能存DF）
-            # 所以我们把 result_df 放入 dfs_context 的一个特殊槽位，供 Main 读取
             dfs_context['__last_result_df__'] = result['result_df']
-
             if result.get('audit_logger'):
                 dfs_context['__last_audit__'] = result['audit_logger']
-                
-            # 并在消息里标记，通知前端
-            log = result['log'] + "\n[System] 已生成结果表格 (result_df)，准备导出。"
-        else:
-            log = result['log']
-            
+        
+        # 即使没有显式 print WORKER_DONE，如果没报错，我们也尝试追加标志
+        log = result['log']
         if "WORKER_DONE" in log or "WORKER_DONE" in code:
              updates["messages"] = [HumanMessage(content=f"✅ 成功:\n{log}\n(Signal: WORKER_DONE)")]
         else:
-             updates["messages"] = [HumanMessage(content=f"✅ 成功:\n{log}")]
+             # 如果没有 done，但也没错，可能是忘了打印。
+             updates["messages"] = [HumanMessage(content=f"✅ 成功 (未检测到结束信号):\n{log}")]
     else:
         updates["messages"] = [HumanMessage(content=result['log'])]
         updates["error_count"] = state.get("error_count", 0) + 1
@@ -407,7 +555,9 @@ def executor_router(state: AgentState):
     last_content = str(messages[-1].content)
     if "❌ Runtime Error" in last_content: return "retry"
     if "WORKER_DONE" in last_content: return "end"
-    return "continue"
+    # ✅ 修复点：如果既没报错，又没DONE，不要死循环回 Worker。
+    # 而是回到 Supervisor，让 LLM 决定是继续还是结束（通常 LLM 看到 log 会觉得完成了）
+    return "supervisor"
 
 def create_workflow(dfs_context: dict):
     from functools import partial
@@ -422,6 +572,11 @@ def create_workflow(dfs_context: dict):
     workflow.add_conditional_edges("supervisor", router_logic, {"python_worker": "python_worker", "auto_eda": "auto_eda", "general_chat": "general_chat", END: END})
     workflow.add_edge("auto_eda", "executor")
     workflow.add_edge("python_worker", "executor")
-    workflow.add_conditional_edges("executor", executor_router, {"retry": "python_worker", "end": END, "continue": "python_worker", "supervisor": "supervisor"})
+    # 路由逻辑修正
+    workflow.add_conditional_edges("executor", executor_router, {
+        "retry": "python_worker", 
+        "end": END, 
+        "supervisor": "supervisor" # 避免死循环
+    })
     workflow.add_edge("general_chat", END)
     return workflow.compile()

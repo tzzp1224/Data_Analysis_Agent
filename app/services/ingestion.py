@@ -62,7 +62,15 @@ def propose_ingestion_config(file_path: str) -> FileLoadConfig:
     csv_preview = df_preview.to_csv(index=True)
     
     header_prompt = ChatPromptTemplate.from_messages([
-        ("system", "你是一个数据专家。找出 Excel 预览数据中真正的列名行(Header)。"),
+        ("system", """你是一个严谨的数据工程师。任务是找出 Excel 的 Header 行号。
+        
+        【判断规则】
+        1. **默认策略**：除非第 0 行显然是“表标题”（如“2024年财务报表”这种合并单元格），或者第 0 行是空行，否则选 0。
+        2. **特征识别**：真正的 Header 行通常包含："日期", "金额", "Name", "ID", "Code" 等字段名。
+        3. **保守原则**：如果你犹豫不决，请返回 0。不要随意跳过行。
+        
+        只返回 JSON: {{ "row": 0, "reason": "..." }}
+        """),
         ("human", """
         数据预览:
         {csv_preview}
