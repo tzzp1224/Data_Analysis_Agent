@@ -2,16 +2,24 @@ import pandas as pd
 import os
 import re
 import json
+import csv
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from app.services.llm_factory import get_llm
 from pydantic import BaseModel, Field
+
+
+EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".xlsb"}
+CSV_EXTENSIONS = {".csv"}
+
 
 # 定义加载配置对象
 class FileLoadConfig(BaseModel):
     file_path: str
     sheet_name: str
     header_row: int
+    file_type: str = Field(default="excel", description="excel 或 csv")
+    delimiter: str = Field(default=",", description="CSV 分隔符")
     reason: str = Field(description="AI 做出此判断的理由")
 
 def clean_gemini_output(raw_content: str) -> str:
@@ -25,12 +33,31 @@ def clean_gemini_output(raw_content: str) -> str:
     content = content.replace("```json", "").replace("```", "").strip()
     return content
 
-def propose_ingestion_config(file_path: str) -> FileLoadConfig:
+def detect_file_type(file_path: str) -> str:
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in EXCEL_EXTENSIONS:
+        return "excel"
+    if ext in CSV_EXTENSIONS:
+        return "csv"
+    raise ValueError(f"不支持的文件类型: {ext}")
+
+
+def detect_csv_delimiter(file_path: str) -> str:
+    try:
+        with open(file_path, "r", encoding="utf-8-sig", newline="") as fp:
+            sample = fp.read(4096)
+        if not sample.strip():
+            return ","
+        sniffed = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        return sniffed.delimiter
+    except Exception:
+        return ","
+
+
+def _propose_excel_ingestion_config(file_path: str) -> FileLoadConfig:
     """
-    👁️ AI 观察文件，提出加载建议
+    👁️ AI 观察 Excel，提出加载建议
     """
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"文件未找到: {file_path}")
 
     # 1. 扫描 Sheet
     xls_file = pd.ExcelFile(file_path)
@@ -103,19 +130,67 @@ def propose_ingestion_config(file_path: str) -> FileLoadConfig:
         file_path=file_path,
         sheet_name=target_sheet,
         header_row=header_row,
-        reason=reason
+        file_type="excel",
+        delimiter=",",
+        reason=reason,
     )
+
+
+def propose_ingestion_config(file_path: str) -> FileLoadConfig:
+    """
+    👁️ AI/规则观察文件，提出加载建议
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"文件未找到: {file_path}")
+
+    file_type = detect_file_type(file_path)
+    if file_type == "excel":
+        return _propose_excel_ingestion_config(file_path)
+
+    delimiter = detect_csv_delimiter(file_path)
+    return FileLoadConfig(
+        file_path=file_path,
+        sheet_name="__csv__",
+        header_row=0,
+        file_type="csv",
+        delimiter=delimiter,
+        reason=f"CSV 文件采用规则模式，默认首行表头，分隔符='{delimiter}'",
+    )
+
+
+def read_csv_with_fallback(file_path: str, header_row: int, delimiter: str) -> pd.DataFrame:
+    decode_errors = []
+    for encoding in ("utf-8-sig", "utf-8", "gbk"):
+        try:
+            return pd.read_csv(
+                file_path,
+                header=header_row,
+                encoding=encoding,
+                sep=delimiter,
+                low_memory=False,
+            )
+        except UnicodeDecodeError as exc:
+            decode_errors.append(f"{encoding}: {exc}")
+        except Exception as exc:
+            raise ValueError(f"CSV 读取失败 ({encoding}): {exc}") from exc
+    raise ValueError("CSV 解码失败: " + " | ".join(decode_errors))
 
 def apply_ingestion(config: FileLoadConfig) -> pd.DataFrame:
     """
     🚀 执行加载
     """
-    print(f"   📂 [Loader] 加载参数: Sheet='{config.sheet_name}', Header={config.header_row}")
-    df = pd.read_excel(
-        config.file_path, 
-        sheet_name=config.sheet_name, 
-        header=config.header_row
-    )
+    if config.file_type == "csv":
+        print(
+            f"   📂 [Loader] 加载参数: Type='csv', Header={config.header_row}, Delimiter='{config.delimiter}'"
+        )
+        df = read_csv_with_fallback(config.file_path, config.header_row, config.delimiter)
+    else:
+        print(f"   📂 [Loader] 加载参数: Sheet='{config.sheet_name}', Header={config.header_row}")
+        df = pd.read_excel(
+            config.file_path,
+            sheet_name=config.sheet_name,
+            header=config.header_row,
+        )
     df.dropna(how='all', axis=1, inplace=True)
     df.dropna(how='all', axis=0, inplace=True)
     return df

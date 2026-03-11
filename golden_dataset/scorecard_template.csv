@@ -1,0 +1,5 @@
+run_id,run_date,branch_or_tag,model,dataset_version,case_id,success,retry_count,latency_seconds,output_file_generated,audit_log_present,chart_count,assertion_passed,assertion_failed_count,notes
+example-001,2026-03-11,codex/p0-baseline,gemini-3-flash-preview,v1.0.1,L1_L2_SALES_DIRTY_MERGE,1,0,12.314,1,1,0,1,0,
+example-001,2026-03-11,codex/p0-baseline,gemini-3-flash-preview,v1.0.1,L3_FIN_RECON_MANY_TO_ONE,1,0,15.827,1,1,0,1,0,
+example-001,2026-03-11,codex/p0-baseline,gemini-3-flash-preview,v1.0.1,INGESTION_MULTI_SHEET_HEADER,1,1,10.552,1,1,0,1,0,
+example-001,2026-03-11,codex/p0-baseline,gemini-3-flash-preview,v1.0.1,L4_VISUAL_TREND,0,2,18.209,1,0,1,0,1,Response missing any of keywords: ['趋势', '异常', '波动']

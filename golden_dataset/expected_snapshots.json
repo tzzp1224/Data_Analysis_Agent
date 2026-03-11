@@ -1,0 +1,104 @@
+{
+  "dataset_version": "v1.0.1",
+  "default_expectations": {
+    "require_download": true,
+    "require_audit": false,
+    "min_chart_count": 0,
+    "xlsx": {
+      "min_sheet_count": 1
+    }
+  },
+  "cases": {
+    "L1_L2_SALES_DIRTY_MERGE": {
+      "require_audit": true,
+      "response_keywords_any": [
+        "清洗",
+        "匹配",
+        "审计"
+      ],
+      "audit_summary": {
+        "min_operations": 1,
+        "min_exclusions": 1
+      },
+      "xlsx": {
+        "min_sheet_count": 3,
+        "required_sheet_name_contains": [
+          "销售台账_脏数据",
+          "客户主数据_标准库",
+          "处理日志(Audit)"
+        ],
+        "min_data_rows_by_sheet": {
+          "销售台账_脏数据": 10,
+          "客户主数据_标准库": 5,
+          "处理日志(Audit)": 1
+        }
+      }
+    },
+    "L3_FIN_RECON_MANY_TO_ONE": {
+      "require_audit": true,
+      "response_keywords_any": [
+        "对账",
+        "容差",
+        "差异"
+      ],
+      "audit_summary": {
+        "min_operations": 1,
+        "min_exclusions": 0
+      },
+      "xlsx": {
+        "min_sheet_count": 3,
+        "required_sheet_name_contains": [
+          "系统日记账_复杂版",
+          "银行流水_复杂版",
+          "处理日志(Audit)"
+        ],
+        "min_data_rows_by_sheet": {
+          "系统日记账_复杂版": 5,
+          "银行流水_复杂版": 4,
+          "处理日志(Audit)": 1
+        }
+      }
+    },
+    "INGESTION_MULTI_SHEET_HEADER": {
+      "require_audit": true,
+      "response_keywords_any": [
+        "清洗",
+        "异常",
+        "处理"
+      ],
+      "audit_summary": {
+        "min_operations": 1,
+        "min_exclusions": 1
+      },
+      "xlsx": {
+        "min_sheet_count": 2,
+        "required_sheet_name_contains": [
+          "多Sheet_采购入库_带说明",
+          "处理日志(Audit)"
+        ],
+        "min_data_rows_by_sheet": {
+          "多Sheet_采购入库_带说明": 5,
+          "处理日志(Audit)": 1
+        }
+      }
+    },
+    "L4_VISUAL_TREND": {
+      "require_audit": false,
+      "min_chart_count": 1,
+      "response_keywords_any": [
+        "趋势",
+        "异常",
+        "波动"
+      ],
+      "xlsx": {
+        "min_sheet_count": 1,
+        "required_sheet_name_contains": [
+          "区域月度经营数据_2024"
+        ],
+        "min_data_rows_by_sheet": {
+          "区域月度经营数据_2024": 30
+        }
+      }
+    }
+  }
+}

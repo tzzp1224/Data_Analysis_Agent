@@ -1,0 +1,62 @@
+{
+  "dataset_name": "Agentic Finance Golden Dataset",
+  "version": "v1.0.1",
+  "generated_at_utc": "2026-03-11T06:32:26Z",
+  "version_policy": {
+    "patch": "v1.0.x: only metadata/evaluation tooling/expectation updates; no case data content changes",
+    "minor": "v1.x.0: add/modify benchmark case data or business scenarios"
+  },
+  "snapshot_config": "expected_snapshots.json",
+  "cases": [
+    {
+      "case_id": "L1_L2_SALES_DIRTY_MERGE",
+      "files": [
+        "cases/cleaning_merge/销售台账_脏数据.xlsx",
+        "cases/cleaning_merge/客户主数据_标准库.xlsx"
+      ],
+      "recommended_prompt": "请先做数据体检与清洗，再把销售表按客户名称与客户主数据做智能对齐，最后导出带审计日志的结果。",
+      "evaluation_focus": [
+        "正确识别销售明细Sheet并处理非首行表头",
+        "处理重复、空值、负数、极端值、金额格式字符串",
+        "smart_merge 对中英别名实体进行对齐",
+        "输出包含处理日志与剔除数据"
+      ]
+    },
+    {
+      "case_id": "L3_FIN_RECON_MANY_TO_ONE",
+      "files": [
+        "cases/reconciliation/系统日记账_复杂版.xlsx",
+        "cases/reconciliation/银行流水_复杂版.xlsx"
+      ],
+      "recommended_prompt": "请识别系统日记账与银行流水，先处理多对一聚合，再进行容差5元对账，输出差异明细和审计日志。",
+      "evaluation_focus": [
+        "对 TRX-9001 与 TRX-9005 正确执行多对一聚合",
+        "对 TRX-9003 识别容差匹配（差额5元）",
+        "识别系统单边账与银行单边账"
+      ]
+    },
+    {
+      "case_id": "INGESTION_MULTI_SHEET_HEADER",
+      "files": [
+        "cases/ingestion/多Sheet_采购入库_带说明.xlsx"
+      ],
+      "recommended_prompt": "加载这个文件并进行数据清洗，输出处理结果和审计日志。",
+      "evaluation_focus": [
+        "从封面/说明页中定位真实数据页",
+        "正确识别第5行作为表头",
+        "识别重复记录和异常负数数量"
+      ]
+    },
+    {
+      "case_id": "L4_VISUAL_TREND",
+      "files": [
+        "cases/visualization/区域月度经营数据_2024.xlsx"
+      ],
+      "recommended_prompt": "分析区域月度GMV趋势，生成图表并给出关键洞察，重点说明异常波动。",
+      "evaluation_focus": [
+        "至少生成1张可视化图表",
+        "文字洞察可解释 8 月华南异常与 12 月华东峰值"
+      ]
+    }
+  ]
+}

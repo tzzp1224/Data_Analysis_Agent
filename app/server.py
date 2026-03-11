@@ -1,21 +1,20 @@
 import sys
 import os
 import uuid
-import shutil
-import pandas as pd
+import re
+import time
 import uvicorn
-import io
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import List, Optional
 
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.services.ingestion import load_file
+from app.services.exporter import save_full_context_excel
 from app.services.workflow import create_workflow
-from app.utils.tools import AuditLogger
 
 app = FastAPI(title="Agentic Data Analyst API")
 
@@ -24,6 +23,9 @@ app = FastAPI(title="Agentic Data Analyst API")
 # ==========================================
 UPLOAD_DIR = "temp_uploads"
 OUTPUT_DIR = "temp_outputs"
+MAX_UPLOAD_SIZE_BYTES = 20 * 1024 * 1024
+SESSION_TTL_SECONDS = 4 * 60 * 60
+ALLOWED_EXTENSIONS = {".xlsx", ".xls", ".csv"}
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -34,6 +36,13 @@ class SessionData:
     def __init__(self):
         self.dfs_context = {}  # 存放 DataFrames
         self.workflow_app = None # 编译好的 Graph
+        self.download_tokens: dict[str, str] = {}
+        self.uploaded_files: set[str] = set()
+        self.generated_files: set[str] = set()
+        self.last_active_ts = time.time()
+
+    def touch(self):
+        self.last_active_ts = time.time()
 
 sessions: dict[str, SessionData] = {}
 
@@ -50,94 +59,119 @@ class ChatResponse(BaseModel):
     download_url: Optional[str] = None
     audit_summary: Optional[str] = None
 
-# ==========================================
-# 🛠️ 核心工具：纯净版导出 (User Request Fix)
-# ==========================================
-def save_full_context_excel(result_df: Optional[pd.DataFrame], 
-                          dfs_context: Dict[str, pd.DataFrame], 
-                          audit: AuditLogger, 
-                          output_path: str):
-    """
-    将 【所有当前数据表】 + 【审计日志】 保存到一个 Excel。
-    修改点：不再强制生成“分析结果”Sheet，而是直接保存 dfs_context 中的文件，
-    确保文件名和 Sheet 名一一对应，且内容为清洗后的版本。
-    """
-    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-        saved_sheets = set()
 
-        # 1. 优先写入上下文中的所有数据表 (Cleaned Files)
-        # 因为 Worker 已经执行了 dfs[name] = df，所以这里就是清洗后的数据
-        if dfs_context:
-            for name, df in dfs_context.items():
-                if name.startswith("__"): continue # 跳过系统变量
-                
-                # Sheet 名处理 (Excel 限制 31 字符)
-                # 去掉 .xlsx 后缀，直接用文件名，简洁明了
-                safe_name = os.path.splitext(name)[0][:30]
-                
-                # 避免重名
-                counter = 1
-                original_name = safe_name
-                while safe_name in saved_sheets:
-                    safe_name = f"{original_name}_{counter}"
-                    counter += 1
-                
-                df.to_excel(writer, sheet_name=safe_name, index=False)
-                saved_sheets.add(safe_name)
-        
-        # 2. (可选) 只有当 result_df 是全新的聚合结果(不在dfs_context里)时，才保存
-        # 但为了满足“不需要分析结果Sheet”的要求，这里直接注释掉，除非你做聚合分析
-        # if result_df is not None: ...
-        
-        # 3. 写入审计日志 (Audit)
-        if audit:
-            log_df = audit.get_log_df()
-            if not log_df.empty:
-                log_df.to_excel(writer, sheet_name='处理日志(Audit)', index=False)
-            
-            # 4. 写入被剔除的数据 (Exclusions)
-            for name, ex_df in audit.excluded_data.items():
-                # 简化的 Sheet 名
-                clean_name = os.path.splitext(name)[0][:10]
-                sheet_name = f"剔除_{clean_name}"[:30]
-                ex_df.to_excel(writer, sheet_name=sheet_name, index=False)
-                
+def sanitize_filename(filename: str) -> str:
+    base_name = os.path.basename(filename or "")
+    sanitized = re.sub(r"[^A-Za-z0-9._-]", "_", base_name)
+    if not sanitized:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return sanitized
+
+
+def validate_upload_filename(filename: str) -> None:
+    extension = os.path.splitext(filename)[1].lower()
+    if extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type: {extension}. Allowed: {sorted(ALLOWED_EXTENSIONS)}",
+        )
+
+
+def save_upload_stream(upload_file: UploadFile, target_path: str) -> None:
+    total_bytes = 0
+    try:
+        with open(target_path, "wb") as buffer:
+            while True:
+                chunk = upload_file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > MAX_UPLOAD_SIZE_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large. Max allowed is {MAX_UPLOAD_SIZE_BYTES // (1024 * 1024)}MB",
+                    )
+                buffer.write(chunk)
+    except HTTPException:
+        if os.path.exists(target_path):
+            os.remove(target_path)
+        raise
+
+
+def remove_file_quietly(path: str) -> None:
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def cleanup_session_assets(session: SessionData) -> None:
+    for upload_name in session.uploaded_files:
+        remove_file_quietly(os.path.join(UPLOAD_DIR, upload_name))
+    for output_name in session.generated_files:
+        remove_file_quietly(os.path.join(OUTPUT_DIR, output_name))
+    session.download_tokens.clear()
+
+
+def cleanup_expired_sessions() -> None:
+    now = time.time()
+    expired_ids = [
+        session_id
+        for session_id, session in sessions.items()
+        if now - session.last_active_ts > SESSION_TTL_SECONDS
+    ]
+    for session_id in expired_ids:
+        cleanup_session_assets(sessions[session_id])
+        del sessions[session_id]
+
 # ==========================================
 # 🚀 API 接口
 # ==========================================
 
 @app.post("/upload")
 async def upload_files(session_id: str = Form(...), files: List[UploadFile] = File(...)):
+    cleanup_expired_sessions()
     if session_id not in sessions:
         sessions[session_id] = SessionData()
     
     session = sessions[session_id]
+    session.touch()
     loaded_info = []
 
     for file in files:
-        file_path = os.path.join(UPLOAD_DIR, f"{session_id}_{file.filename}")
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        safe_filename = sanitize_filename(file.filename)
+        validate_upload_filename(safe_filename)
+        storage_name = f"{session_id}_{safe_filename}"
+        file_path = os.path.join(UPLOAD_DIR, storage_name)
+        save_upload_stream(file, file_path)
         
         try:
             df = load_file(file_path)
-            session.dfs_context[file.filename] = df
+            session.dfs_context[safe_filename] = df
             # ✅ 新增：创建隐形备份 (Deep Copy)
-            session.dfs_context[f"__backup_{file.filename}"] = df.copy(deep=True)
-            loaded_info.append(f"{file.filename} (Rows: {len(df)})")
+            session.dfs_context[f"__backup_{safe_filename}"] = df.copy(deep=True)
+            session.uploaded_files.add(storage_name)
+            loaded_info.append(f"{safe_filename} (Rows: {len(df)})")
+        except HTTPException:
+            remove_file_quietly(file_path)
+            raise
         except Exception as e:
-            return {"error": f"Failed to load {file.filename}: {str(e)}"}
+            remove_file_quietly(file_path)
+            raise HTTPException(status_code=400, detail=f"Failed to load {safe_filename}: {str(e)}")
 
     session.workflow_app = create_workflow(session.dfs_context)
     return {"message": "Upload success", "details": loaded_info}
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
+    cleanup_expired_sessions()
     session_id = request.session_id
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session expired")
     
     session = sessions[session_id]
+    session.touch()
     if not session.workflow_app:
         session.workflow_app = create_workflow({})
 
@@ -215,7 +249,10 @@ async def chat(request: ChatRequest):
             # 传入 session.dfs_context 以保存所有被清洗过的表
             save_full_context_excel(result_df, session.dfs_context, audit_logger, file_path)
             
-            download_link = f"/download/{filename}"
+            download_token = uuid.uuid4().hex
+            session.download_tokens[download_token] = filename
+            session.generated_files.add(filename)
+            download_link = f"/download/{filename}?session_id={session_id}&token={download_token}"
             
             if audit_logger:
                 op_count = len([l for l in audit_logger.logs if l['Type']=='Operation'])
@@ -263,10 +300,21 @@ async def chat(request: ChatRequest):
     )
 
 @app.get("/download/{filename}")
-async def download_file(filename: str):
-    file_path = os.path.join(OUTPUT_DIR, filename)
+async def download_file(filename: str, session_id: str, token: str):
+    cleanup_expired_sessions()
+    safe_filename = os.path.basename(filename)
+    session = sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session expired")
+    session.touch()
+
+    issued_filename = session.download_tokens.get(token)
+    if issued_filename != safe_filename:
+        raise HTTPException(status_code=403, detail="Invalid download token")
+
+    file_path = os.path.join(OUTPUT_DIR, safe_filename)
     if os.path.exists(file_path):
-        return FileResponse(file_path, filename=filename)
+        return FileResponse(file_path, filename=safe_filename)
     raise HTTPException(status_code=404, detail="File not found")
 
 if __name__ == "__main__":

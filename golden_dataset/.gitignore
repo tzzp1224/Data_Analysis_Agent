@@ -1,0 +1,4 @@
+__pycache__/
+runs/
+scorecard_latest.csv
+cases/.DS_Store

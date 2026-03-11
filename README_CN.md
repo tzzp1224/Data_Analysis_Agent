@@ -39,6 +39,48 @@
 - 基于自然语言指令生成 Plotly 交互式图表。
 - 在图表输出的同时，自动提取数据趋势与业务洞察。
 
+## 阶段A安全加固（可信执行层）
+
+本仓库已完成一轮聚焦 P0 风险的安全改造：
+
+- **可信执行器（`app/services/trusted_exec.py`）**
+  - 生成代码在独立子进程执行，支持超时中断。
+  - 执行前进行 AST 安全校验。
+  - 阻断高风险能力（`exec/eval/open/__import__`、系统进程调用、直接文件 I/O API）。
+  - 采用受限内建函数与最小化 import 白名单（`pandas`、`numpy`、`re`、`plotly`、`warnings`）。
+
+- **Prompt Injection 降风险**
+  - 不再把 `df.head().to_string()` 原始内容直接注入 prompt。
+  - 改为清洗后的结构化 schema 快照，并在系统提示中声明“数据内容不可信、不可当指令执行”。
+
+- **上传/下载安全**
+  - 上传链路增加文件名清洗、扩展名白名单、大小限制。
+  - 下载链路改为 `session_id + token` 绑定，避免“仅凭文件名即可下载”。
+
+## P0 可用性稳定化（已完成）
+
+本仓库已完成一轮聚焦“可用性 + 工程化解耦”的 P0 改造：
+
+- **导出能力解耦**
+  - 将导出逻辑从 API 层抽离到 `app/services/exporter.py`。
+  - CLI 与 FastAPI 共用同一套导出实现，避免重复逻辑与路径漂移。
+
+- **CSV 摄取能力补齐**
+  - 摄取链路按文件类型分支（`excel` / `csv`），不再默认按 Excel 解析。
+  - CSV 模式使用规则化默认（首行为表头）、分隔符自动探测、编码回退机制。
+
+- **Workflow 提示词与工具一致性**
+  - 移除提示词中不存在的 `vector_match` 调用建议。
+  - Worker 指引与现有工具能力（`smart_merge`、`smart_reconcile`）保持一致。
+
+- **审计持久化修复**
+  - 不再依赖 `result_df` 才写入审计上下文。
+  - 只要发生过处理操作，导出报告即可稳定包含审计日志。
+
+- **会话运行时治理**
+  - 增加内存会话 TTL 清理（默认 4 小时）。
+  - 会话过期时同步清理关联上传/导出临时文件，降低资源泄漏风险。
+
 ## 安装与部署
 
 ### 环境要求
@@ -95,11 +137,35 @@ streamlit run app/ui.py
 
 启动后，访问浏览器地址 `http://localhost:8501` 使用系统。
 
+## Golden Dataset（评测基线数据）
+
+仓库已内置可复用的回归评测数据集，用于优化前后效果对比：
+
+- 目录：`golden_dataset/`
+- 用例清单：`golden_dataset/manifest.json`
+- 快照断言配置：`golden_dataset/expected_snapshots.json`
+- 数据文件：`golden_dataset/cases/`（覆盖清洗/对齐、对账、摄取、可视化）
+- 评估记录模板：`golden_dataset/scorecard_template.csv`
+- 变更日志：`golden_dataset/CHANGELOG.md`
+
+可通过以下命令确定性重建全部 Excel：
+
+```bash
+python golden_dataset/build_golden_dataset.py
+```
+
+按 manifest 自动批量评测并写入 scorecard：
+
+```bash
+python golden_dataset/run_evaluation.py --api-url http://localhost:8000
+```
+
 ## 待优化方向 (Roadmap)
 
-- **安全沙箱 (P0):** 引入 Docker 容器化方案，替代本地 `exec()`，实现代码执行环境的完全隔离。
-- **持久化存储 (P1):** 集成 Redis 进行状态管理，使用 PostgreSQL/MinIO 存储业务数据。
-- **大规模检索 (P2):** 集成向量数据库 (FAISS/Chroma) 以支持大规模实体对齐。
+- **P1（下一阶段）:** 将核心流程从“自由代码生成”升级为“结构化工具编排（Tool Calling）”。
+- **P1（下一阶段）:** 补齐确定性对账模板（多对一聚合、容差策略、差异归因分层）。
+- **P2:** 增加生产级持久化（Redis + SQL/对象存储）与鉴权授权能力。
+- **P2:** 建立评测与可观测体系（成功率、延迟、重试/错误画像）。
 
 ## 开源协议
 

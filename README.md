@@ -40,6 +40,48 @@ The system categorizes capabilities into four levels (L1-L4):
 - Generates interactive charts (Plotly) based on natural language queries.
 - Provides automated insights and trend analysis alongside visual outputs.
 
+## Stage A Security Hardening (Trusted Execution)
+
+This repo now includes a focused P0 hardening pass on execution and file delivery:
+
+- **Trusted Executor (`app/services/trusted_exec.py`)**
+  - Runs generated Python code in a dedicated subprocess with timeout control.
+  - Applies AST-based security validation before execution.
+  - Blocks dangerous operations (`exec/eval/open/__import__`, OS/process calls, direct file I/O APIs).
+  - Uses restricted builtins and a narrow import allowlist (`pandas`, `numpy`, `re`, `plotly`, `warnings`).
+
+- **Prompt Injection Reduction**
+  - Replaces raw `df.head().to_string()` prompt context with sanitized structured schema snapshots.
+  - Treats dataset content as untrusted input in the worker system prompt.
+
+- **Upload/Download Security**
+  - Upload path now enforces filename sanitization, extension allowlist, and size limit.
+  - Download endpoint now requires `session_id + token` binding instead of filename-only access.
+
+## P0 Usability Stabilization (Completed)
+
+This repository now includes a focused P0 pass for reliability and engineering hygiene:
+
+- **Decoupled Export Service**
+  - Export logic moved from API layer to `app/services/exporter.py`.
+  - CLI and FastAPI now share the same export implementation, avoiding duplicated/fragile paths.
+
+- **CSV-Compatible Ingestion**
+  - Ingestion now branches by file type (`excel` / `csv`) instead of assuming Excel only.
+  - CSV mode uses rule-based defaults (header row = 0), delimiter sniffing, and encoding fallback.
+
+- **Workflow Prompt/Tool Consistency**
+  - Removed reference to unavailable `vector_match` in worker prompt.
+  - Worker guidance now aligns with available tools (`smart_merge`, `smart_reconcile`).
+
+- **Audit Persistence Fix**
+  - Audit context is now persisted even when no `result_df` is explicitly produced.
+  - Exported reports consistently include audit trail when operations occurred.
+
+- **Session Runtime Hygiene**
+  - Added in-memory session TTL cleanup (default 4 hours).
+  - Expired sessions now clean associated upload/output temp files.
+
 ## Installation
 
 ### Prerequisites
@@ -96,11 +138,35 @@ streamlit run app/ui.py
 
 Access the web interface at `http://localhost:8501`.
 
+## Golden Dataset
+
+For regression and optimization benchmarking, a reusable golden dataset is included:
+
+- Folder: `golden_dataset/`
+- Manifest: `golden_dataset/manifest.json`
+- Expected snapshots: `golden_dataset/expected_snapshots.json`
+- Cases: `golden_dataset/cases/` (cleaning/merge, reconciliation, ingestion, visualization)
+- Scorecard template: `golden_dataset/scorecard_template.csv`
+- Changelog: `golden_dataset/CHANGELOG.md`
+
+Regenerate all Excel files deterministically with:
+
+```bash
+python golden_dataset/build_golden_dataset.py
+```
+
+Run automated benchmark (batch by manifest + snapshot assertions):
+
+```bash
+python golden_dataset/run_evaluation.py --api-url http://localhost:8000
+```
+
 ## Roadmap
 
-- **Security (P0):** Implement Docker Sandbox for isolated code execution (replacing local `exec()`).
-- **Persistence (P1):** Integration with Redis for state management and PostgreSQL/MinIO for file storage.
-- **Performance (P2):** Integration with vector databases (FAISS/Chroma) for large-scale entity alignment.
+- **P1 (Next):** Shift core workflow from free-form code generation to structured tool-calling orchestration.
+- **P1 (Next):** Add deterministic reconciliation templates (many-to-one, tolerance policy, exception triage).
+- **P2:** Add production-grade persistence (Redis + SQL/Object Storage) and authn/authz controls.
+- **P2:** Build evaluation harness and observability dashboard (success rate, latency, retry/error profile).
 
 ## License
 

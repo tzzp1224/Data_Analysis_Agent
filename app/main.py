@@ -1,6 +1,5 @@
 import sys
 import os
-import pandas as pd
 import plotly.io as pio
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -10,6 +9,7 @@ from app.utils.generator import create_complex_test_data
 from app.utils.finance_generator import create_reconciliation_data
 # 引入 Ingestion 组件
 from app.services.ingestion import propose_ingestion_config, apply_ingestion
+from app.services.exporter import save_result_with_audit
 from app.services.workflow import create_workflow
 
 def interactive_file_loader(file_paths: list):
@@ -126,19 +126,12 @@ def main():
                             audit_logger = dfs_context.pop('__last_audit__', None)
                             
                             output_path = "data/output_result.xlsx"
+                            os.makedirs(os.path.dirname(output_path), exist_ok=True)
                             
-                            # 动态导入 server 中的保存函数，或者在这里简单实现保存逻辑
-                            # 为了演示 CLI，我们简单保存，包含审计
-                            from app.server import save_result_with_audit
-                            try:
-                                save_result_with_audit(res_df, audit_logger, output_path)
-                                print(f"   💾 [交付] 结果文件已保存至: {output_path}")
-                                if audit_logger:
-                                    print(f"      (包含审计日志 Sheet)")
-                            except ImportError:
-                                # 如果还没写 server.py，就普通保存
-                                res_df.to_excel(output_path, index=False)
-                                print(f"   💾 [交付] 结果文件已保存 (无审计功能，请运行 server 模式体验完整功能)")
+                            save_result_with_audit(res_df, audit_logger, output_path)
+                            print(f"   💾 [交付] 结果文件已保存至: {output_path}")
+                            if audit_logger:
+                                print(f"      (包含审计日志 Sheet)")
 
                         # 处理图表
                         if "chart_jsons" in val and val["chart_jsons"]:
