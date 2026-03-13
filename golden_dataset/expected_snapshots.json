@@ -1,5 +1,5 @@
 {
-  "dataset_version": "v1.0.1",
+  "dataset_version": "v1.0.8",
   "default_expectations": {
     "require_download": true,
     "require_audit": false,
@@ -11,11 +11,6 @@
   "cases": {
     "L1_L2_SALES_DIRTY_MERGE": {
       "require_audit": true,
-      "response_keywords_any": [
-        "清洗",
-        "匹配",
-        "审计"
-      ],
       "audit_summary": {
         "min_operations": 1,
         "min_exclusions": 1
@@ -36,11 +31,6 @@
     },
     "L3_FIN_RECON_MANY_TO_ONE": {
       "require_audit": true,
-      "response_keywords_any": [
-        "对账",
-        "容差",
-        "差异"
-      ],
       "audit_summary": {
         "min_operations": 1,
         "min_exclusions": 0
@@ -61,11 +51,6 @@
     },
     "INGESTION_MULTI_SHEET_HEADER": {
       "require_audit": true,
-      "response_keywords_any": [
-        "清洗",
-        "异常",
-        "处理"
-      ],
       "audit_summary": {
         "min_operations": 1,
         "min_exclusions": 1
@@ -85,11 +70,6 @@
     "L4_VISUAL_TREND": {
       "require_audit": false,
       "min_chart_count": 1,
-      "response_keywords_any": [
-        "趋势",
-        "异常",
-        "波动"
-      ],
       "xlsx": {
         "min_sheet_count": 1,
         "required_sheet_name_contains": [

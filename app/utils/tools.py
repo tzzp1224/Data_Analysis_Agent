@@ -61,15 +61,21 @@ class VectorMatcher:
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(VectorMatcher, cls).__new__(cls)
-            if HAS_VECTOR_MODEL:
-                print("⏳ [System] 正在加载语义向量模型 (paraphrase-multilingual)...")
-                cls._model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-                print("✅ 模型加载完毕")
         return cls._instance
+
+    @classmethod
+    def _ensure_model(cls):
+        if cls._model is not None or not HAS_VECTOR_MODEL:
+            return
+        print("⏳ [System] 正在加载语义向量模型 (paraphrase-multilingual)...")
+        cls._model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+        print("✅ 模型加载完毕")
 
     def get_candidates(self, source_word: str, target_candidates: list, top_k=5):
         """返回最相似的 Top K 个候选项"""
-        if not self._model: return []
+        self._ensure_model()
+        if not self._model:
+            return []
         
         source_emb = self._model.encode(source_word, convert_to_tensor=True)
         target_embs = self._model.encode(target_candidates, convert_to_tensor=True)
@@ -138,13 +144,13 @@ def smart_merge(left_df: pd.DataFrame, right_df: pd.DataFrame,
     mapping = {}
     matched_log = []
     
-    vector_matcher = VectorMatcher() if HAS_VECTOR_MODEL else None
+    # 策略选择
+    use_full_llm_match = len(right_keys) <= 50
+    vector_matcher = VectorMatcher() if (HAS_VECTOR_MODEL and not use_full_llm_match) else None
     llm_judge = LLMJudge()
     
     print(f"🔍 [SmartMerge] 开始智能匹配 (Left: {len(left_keys)}, Right: {len(right_keys)})")
     
-    # 策略选择
-    use_full_llm_match = len(right_keys) <= 50
     if use_full_llm_match:
         print("   🚀 [Strategy] 目标数据量较小，启用 LLM 全量精准匹配模式")
     

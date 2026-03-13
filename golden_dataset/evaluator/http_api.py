@@ -84,6 +84,15 @@ class AgentApiClient:
         response_bytes = self._open(req)
         return json.loads(response_bytes.decode("utf-8"))
 
+    def healthcheck(self) -> dict[str, Any]:
+        health_url = f"{self.base_url}/health"
+        req = request.Request(health_url, method="GET")
+        response_bytes = self._open(req)
+        data = json.loads(response_bytes.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ApiClientError("Invalid /health response payload.")
+        return data
+
     def chat(self, session_id: str, prompt: str) -> ChatResult:
         chat_url = f"{self.base_url}/chat"
         payload = json.dumps({"session_id": session_id, "message": prompt}).encode("utf-8")

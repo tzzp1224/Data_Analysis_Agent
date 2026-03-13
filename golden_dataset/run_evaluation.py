@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 import json
+import re
 import subprocess
 import time
 import uuid
@@ -133,6 +134,29 @@ def merge_expectations(
     return merged
 
 
+def extract_backend_error(response_text: str) -> str | None:
+    if not response_text:
+        return None
+
+    system_error_match = re.search(r"系统异常:\s*(.+)", response_text)
+    if system_error_match:
+        return system_error_match.group(1).strip()
+
+    runtime_error_match = re.search(r"❌ Runtime Error:\s*(.+)", response_text, re.DOTALL)
+    if runtime_error_match:
+        lines = [line.strip() for line in runtime_error_match.group(1).strip().splitlines() if line.strip()]
+        for line in reversed(lines):
+            if line.startswith("Traceback"):
+                continue
+            if line.startswith("File "):
+                continue
+            return line[:300]
+        if lines:
+            return lines[-1][:300]
+
+    return None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run batch regression benchmark from manifest.")
     parser.add_argument("--api-url", default="http://localhost:8000", help="Backend API base URL.")
@@ -210,6 +234,25 @@ def main() -> None:
         print("ℹ️ Dry-run mode: API calls are skipped.")
 
     client = AgentApiClient(args.api_url, timeout_seconds=args.timeout_seconds)
+    if not args.dry_run:
+        try:
+            health = client.healthcheck()
+        except ApiClientError as exc:
+            raise SystemExit(f"Preflight failed: cannot reach API /health. {exc}") from exc
+
+        if health.get("status") != "ok":
+            raise SystemExit(f"Preflight failed: unexpected health status: {health}")
+        if not bool(health.get("llm_ready")):
+            model = health.get("model", "unknown")
+            raise SystemExit(
+                f"Preflight failed: API is up but LLM key is not ready "
+                f"(model={model}). Please check GOOGLE_API_KEY in server environment."
+            )
+        print(
+            "✅ Preflight passed: "
+            f"api={args.api_url} model={health.get('model', 'unknown')} "
+            f"active_sessions={health.get('active_sessions', 'n/a')}"
+        )
 
     for case in cases:
         case_id = case["case_id"]
@@ -282,6 +325,10 @@ def main() -> None:
                 expectations=case_expect,
                 observed=observed,
             )
+            backend_error = extract_backend_error(chat_result.response_text)
+            if backend_error:
+                assertion_failures.insert(0, f"Backend error: {backend_error}")
+                assertion_passed = False
             case_notes.extend(assertion_failures)
 
             summary_rows.append(
@@ -335,7 +382,14 @@ def main() -> None:
         rows.append(row)
 
         status_text = "PASS" if assertion_passed else "FAIL"
-        print(f"[{status_text}] {case_id} latency={latency:.2f}s retries={retry_count} charts={chart_count}")
+        if assertion_passed:
+            print(f"[{status_text}] {case_id} latency={latency:.2f}s retries={retry_count} charts={chart_count}")
+        else:
+            first_reason = case_notes[0] if case_notes else "Unknown failure"
+            print(
+                f"[{status_text}] {case_id} latency={latency:.2f}s retries={retry_count} "
+                f"charts={chart_count} reason={first_reason}"
+            )
 
     with output_csv.open("w", encoding="utf-8", newline="") as fp:
         writer = csv.DictWriter(fp, fieldnames=CSV_FIELDS)

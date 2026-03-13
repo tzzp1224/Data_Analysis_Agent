@@ -198,11 +198,12 @@ def apply_ingestion(config: FileLoadConfig) -> pd.DataFrame:
 # ==========================================
 # ✅ 补回 load_file 函数 (适配 Web API)
 # ==========================================
-def load_file(file_path: str) -> pd.DataFrame:
+def load_file(file_path: str, display_name: str = "") -> pd.DataFrame:
     """
     [自动模式] 组合 propose 和 apply，直接加载文件。
     专门供 Server API 使用，默认采纳 AI 建议。
     """
-    print(f"🔄 [Auto-Ingest] 正在自动分析并加载: {os.path.basename(file_path)}")
+    shown_name = display_name or os.path.basename(file_path)
+    print(f"🔄 [Auto-Ingest] 正在自动分析并加载: {shown_name}")
     config = propose_ingestion_config(file_path)
     return apply_ingestion(config)

@@ -22,6 +22,8 @@
 ```bash
 python golden_dataset/run_evaluation.py --api-url http://localhost:8000
 ```
+评测会先做 `/health` 预检（API 可达性 + `llm_ready`），避免整批 case 跑完才发现环境配置问题。
+
 输出：
 - `golden_dataset/runs/scorecard_<run_id>.csv`
 - `golden_dataset/runs/summary_<run_id>.json`
@@ -38,7 +40,7 @@ python golden_dataset/run_evaluation.py --api-url http://localhost:8000
 - 变更记录见：`CHANGELOG.md`
 
 ## 版本
-- 当前版本：`v1.0.1`
+- 当前版本：`v1.0.8`
 
 ## 重新生成
 ```bash

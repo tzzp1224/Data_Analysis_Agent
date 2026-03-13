@@ -15,6 +15,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.services.ingestion import load_file
 from app.services.exporter import save_full_context_excel
 from app.services.workflow import create_workflow
+from app.core.config import settings
+from app.skills.router import route_skill
+from app.skills.engine import execute_skill
 
 app = FastAPI(title="Agentic Data Analyst API")
 
@@ -35,6 +38,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 class SessionData:
     def __init__(self):
         self.dfs_context = {}  # 存放 DataFrames
+        self.backups = {}  # 独立备份区，避免污染业务表上下文
         self.workflow_app = None # 编译好的 Graph
         self.download_tokens: dict[str, str] = {}
         self.uploaded_files: set[str] = set()
@@ -58,6 +62,26 @@ class ChatResponse(BaseModel):
     chart_jsons: List[str] = []
     download_url: Optional[str] = None
     audit_summary: Optional[str] = None
+
+
+def get_exportable_context(dfs_context: dict) -> dict:
+    return {name: df for name, df in dfs_context.items() if not name.startswith("__")}
+
+
+def extract_runtime_error_summary(raw_msg: str) -> str:
+    if "❌ Runtime Error" not in raw_msg:
+        return ""
+    lines = [line.strip() for line in str(raw_msg).splitlines() if line.strip()]
+    # Prefer the last meaningful exception line over traceback header.
+    for line in reversed(lines):
+        if line.startswith("❌ Runtime Error"):
+            continue
+        if line.startswith("Traceback"):
+            continue
+        if line.startswith("File "):
+            continue
+        return line[:300]
+    return "Unknown runtime error"
 
 
 def sanitize_filename(filename: str) -> str:
@@ -112,6 +136,7 @@ def cleanup_session_assets(session: SessionData) -> None:
     for output_name in session.generated_files:
         remove_file_quietly(os.path.join(OUTPUT_DIR, output_name))
     session.download_tokens.clear()
+    session.backups.clear()
 
 
 def cleanup_expired_sessions() -> None:
@@ -124,6 +149,30 @@ def cleanup_expired_sessions() -> None:
     for session_id in expired_ids:
         cleanup_session_assets(sessions[session_id])
         del sessions[session_id]
+
+
+def build_export_response(session: SessionData, session_id: str, result_df, audit_logger):
+    download_link = None
+    audit_summary = None
+    exportable_context = get_exportable_context(session.dfs_context)
+    has_audit_records = bool(audit_logger and not audit_logger.get_log_df().empty)
+
+    if result_df is not None or exportable_context or has_audit_records:
+        filename = f"Analysis_Report_{uuid.uuid4().hex[:6]}.xlsx"
+        file_path = os.path.join(OUTPUT_DIR, filename)
+        save_full_context_excel(result_df, exportable_context, audit_logger, file_path)
+
+        download_token = uuid.uuid4().hex
+        session.download_tokens[download_token] = filename
+        session.generated_files.add(filename)
+        download_link = f"/download/{filename}?session_id={session_id}&token={download_token}"
+
+        if has_audit_records:
+            op_count = len([l for l in audit_logger.logs if l["Type"] == "Operation"])
+            ex_count = len([l for l in audit_logger.logs if l["Type"] == "Exclusion"])
+            audit_summary = f"🛡️ 审计追踪: 执行 {op_count} 步操作, 剔除 {ex_count} 次异常数据。"
+
+    return download_link, audit_summary
 
 # ==========================================
 # 🚀 API 接口
@@ -140,19 +189,22 @@ async def upload_files(session_id: str = Form(...), files: List[UploadFile] = Fi
     loaded_info = []
 
     for file in files:
-        safe_filename = sanitize_filename(file.filename)
+        original_filename = os.path.basename(file.filename or "")
+        if not original_filename:
+            raise HTTPException(status_code=400, detail="Invalid filename")
+
+        safe_filename = sanitize_filename(original_filename)
         validate_upload_filename(safe_filename)
         storage_name = f"{session_id}_{safe_filename}"
         file_path = os.path.join(UPLOAD_DIR, storage_name)
         save_upload_stream(file, file_path)
         
         try:
-            df = load_file(file_path)
-            session.dfs_context[safe_filename] = df
-            # ✅ 新增：创建隐形备份 (Deep Copy)
-            session.dfs_context[f"__backup_{safe_filename}"] = df.copy(deep=True)
+            df = load_file(file_path, display_name=original_filename)
+            session.dfs_context[original_filename] = df
+            session.backups[original_filename] = df.copy(deep=True)
             session.uploaded_files.add(storage_name)
-            loaded_info.append(f"{safe_filename} (Rows: {len(df)})")
+            loaded_info.append(f"{original_filename} (Rows: {len(df)})")
         except HTTPException:
             remove_file_quietly(file_path)
             raise
@@ -160,8 +212,19 @@ async def upload_files(session_id: str = Form(...), files: List[UploadFile] = Fi
             remove_file_quietly(file_path)
             raise HTTPException(status_code=400, detail=f"Failed to load {safe_filename}: {str(e)}")
 
-    session.workflow_app = create_workflow(session.dfs_context)
+    session.workflow_app = create_workflow(session.dfs_context, session.backups)
     return {"message": "Upload success", "details": loaded_info}
+
+
+@app.get("/health")
+async def health():
+    cleanup_expired_sessions()
+    return {
+        "status": "ok",
+        "llm_ready": bool(settings.GOOGLE_API_KEY),
+        "model": settings.GOOGLE_MODEL_NAME,
+        "active_sessions": len(sessions),
+    }
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
@@ -173,7 +236,7 @@ async def chat(request: ChatRequest):
     session = sessions[session_id]
     session.touch()
     if not session.workflow_app:
-        session.workflow_app = create_workflow({})
+        session.workflow_app = create_workflow({}, {})
 
     state = {
         "messages": [], 
@@ -186,6 +249,31 @@ async def chat(request: ChatRequest):
     # 清理旧状态 (保留 context 中的数据表，清除上一次的临时结果)
     if '__last_result_df__' in session.dfs_context: del session.dfs_context['__last_result_df__']
     if '__last_audit__' in session.dfs_context: del session.dfs_context['__last_audit__']
+    for key in list(session.dfs_context.keys()):
+        if str(key).startswith("__backup_"):
+            del session.dfs_context[key]
+
+    skill_name = route_skill(request.message, session.dfs_context)
+    if skill_name:
+        skill_result = execute_skill(skill_name, session.dfs_context, request.message)
+        if skill_result and skill_result.handled:
+            response_text = (
+                f"❌ Runtime Error: {skill_result.error}"
+                if skill_result.error
+                else skill_result.response_text
+            )
+            download_link, audit_summary = build_export_response(
+                session,
+                session_id=session_id,
+                result_df=skill_result.result_df,
+                audit_logger=skill_result.audit,
+            )
+            return ChatResponse(
+                response_text=response_text,
+                chart_jsons=skill_result.chart_jsons,
+                download_url=download_link,
+                audit_summary=audit_summary,
+            )
 
     # 初始化返回变量
     chart_jsons = []
@@ -194,6 +282,8 @@ async def chat(request: ChatRequest):
     steps_log = []
     final_answer = ""
     error_msg = None
+    last_runtime_error_summary = ""
+    saw_executor_success = False
 
     try:
         # 运行 Workflow
@@ -219,10 +309,15 @@ async def chat(request: ChatRequest):
                             clean = raw_msg.replace("(Signal: WORKER_DONE)", "").strip()
                             if clean not in final_answer:
                                 final_answer += clean + "\n\n"
+                        if "✅ 成功" in raw_msg:
+                            saw_executor_success = True
 
                         # 3. 拦截报错
                         if "❌ Runtime Error" in raw_msg:
                             steps_log.append("🔧 **自愈**: 检测到代码错误，正在自动修正...")
+                            summary = extract_runtime_error_summary(raw_msg)
+                            if summary:
+                                last_runtime_error_summary = summary
 
                     if "chart_jsons" in val:
                         chart_jsons.extend(val["chart_jsons"])
@@ -231,33 +326,9 @@ async def chat(request: ChatRequest):
                     if "messages" in val:
                         final_answer += val["messages"][0].content
 
-        # ==========================================
-        # 💾 文件导出逻辑 (核心修改)
-        # ==========================================
-        # 即使没有 __last_result_df__，只要有数据表和审计日志，也可以导出
-        # 但通常 Workflow 结束时至少会生成审计对象
-        
         result_df = session.dfs_context.pop('__last_result_df__', None)
         audit_logger = session.dfs_context.pop('__last_audit__', None)
-        
-        # 只要有数据或者有结果，就生成 Excel
-        if result_df is not None or len(session.dfs_context) > 0:
-            filename = f"Analysis_Report_{uuid.uuid4().hex[:6]}.xlsx"
-            file_path = os.path.join(OUTPUT_DIR, filename)
-            
-            # ✅ 调用新的全量保存函数
-            # 传入 session.dfs_context 以保存所有被清洗过的表
-            save_full_context_excel(result_df, session.dfs_context, audit_logger, file_path)
-            
-            download_token = uuid.uuid4().hex
-            session.download_tokens[download_token] = filename
-            session.generated_files.add(filename)
-            download_link = f"/download/{filename}?session_id={session_id}&token={download_token}"
-            
-            if audit_logger:
-                op_count = len([l for l in audit_logger.logs if l['Type']=='Operation'])
-                ex_count = len([l for l in audit_logger.logs if l['Type']=='Exclusion'])
-                audit_summary = f"🛡️ 审计追踪: 执行 {op_count} 步操作, 剔除 {ex_count} 次异常数据。"
+        download_link, audit_summary = build_export_response(session, session_id, result_df, audit_logger)
 
     except Exception as e:
         error_msg = f"系统异常: {str(e)}"
@@ -291,6 +362,10 @@ async def chat(request: ChatRequest):
     if error_msg:
         formatted_response += f"\n\n🚨 **错误提示**: {error_msg}"
         if not final_answer: formatted_response = error_msg
+    elif last_runtime_error_summary and not saw_executor_success:
+        formatted_response += f"\n\n❌ Runtime Error: {last_runtime_error_summary}"
+        if not final_answer and not steps_log:
+            formatted_response = f"❌ Runtime Error: {last_runtime_error_summary}"
 
     return ChatResponse(
         response_text=formatted_response,

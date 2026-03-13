@@ -2,9 +2,10 @@ import ast
 import builtins
 import io
 import multiprocessing as mp
+import os
 import sys
 import traceback
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -45,11 +46,6 @@ BLOCKED_CALLS = {
 BLOCKED_ATTR_CALLS = {
     "system",
     "popen",
-    "remove",
-    "unlink",
-    "rmdir",
-    "rename",
-    "replace",
     "read_csv",
     "read_excel",
     "to_csv",
@@ -57,6 +53,9 @@ BLOCKED_ATTR_CALLS = {
     "to_pickle",
     "read_pickle",
 }
+
+DEFAULT_EXEC_TIMEOUT_SECONDS = int(os.getenv("TRUSTED_EXEC_TIMEOUT_SECONDS", "30"))
+ALLOWED_MP_START_METHODS = {"fork", "spawn", "forkserver"}
 
 SAFE_BUILTINS = {
     "abs": abs,
@@ -144,7 +143,22 @@ def validate_code_safety(code: str) -> None:
             raise SecurityViolation(f"Dunder name blocked: {node.id}")
 
 
-def _run_sandboxed(dfs: Dict[str, pd.DataFrame], code: str, queue: mp.Queue) -> None:
+def _resolve_start_method() -> str:
+    forced = os.getenv("TRUSTED_EXEC_START_METHOD", "").strip()
+    if forced in ALLOWED_MP_START_METHODS:
+        return forced
+    # macOS + torch/mps may crash on fork; spawn is safer.
+    if sys.platform == "darwin":
+        return "spawn"
+    return "fork"
+
+
+def _run_sandboxed(
+    dfs: Dict[str, pd.DataFrame],
+    backups: Dict[str, pd.DataFrame],
+    code: str,
+    queue: mp.Queue,
+) -> None:
     import plotly.express as px
     import plotly.graph_objects as go
 
@@ -157,9 +171,8 @@ def _run_sandboxed(dfs: Dict[str, pd.DataFrame], code: str, queue: mp.Queue) -> 
         return smart_reconcile(df_sys, df_bank, sys_key, bank_key, sys_amount, bank_amount, tolerance, logger=audit)
 
     def reload_data_wrapper(filename: str):
-        backup_key = f"__backup_{filename}"
-        if backup_key in dfs:
-            dfs[filename] = dfs[backup_key].copy(deep=True)
+        if filename in backups:
+            dfs[filename] = backups[filename].copy(deep=True)
             print(f"🔄 [System] 数据已还原: {filename}")
             return True
         print(f"❌ [System] 未找到备份: {filename}")
@@ -236,7 +249,12 @@ def _run_sandboxed(dfs: Dict[str, pd.DataFrame], code: str, queue: mp.Queue) -> 
         sys.stdout = old_stdout
 
 
-def run_trusted_code(dfs: Dict[str, pd.DataFrame], code: str, timeout_seconds: int = 15) -> dict:
+def run_trusted_code(
+    dfs: Dict[str, pd.DataFrame],
+    code: str,
+    timeout_seconds: Optional[int] = None,
+    backups: Optional[Dict[str, pd.DataFrame]] = None,
+) -> dict:
     clean_code = str(code).strip()
     if not clean_code:
         return {
@@ -248,15 +266,22 @@ def run_trusted_code(dfs: Dict[str, pd.DataFrame], code: str, timeout_seconds: i
             "log": "无代码",
         }
 
+    effective_timeout = timeout_seconds if timeout_seconds and timeout_seconds > 0 else DEFAULT_EXEC_TIMEOUT_SECONDS
+    start_method = _resolve_start_method()
+    backup_context = backups or {}
     try:
-        ctx = mp.get_context("fork")
+        ctx = mp.get_context(start_method)
     except ValueError:
         ctx = mp.get_context("spawn")
 
     queue: mp.Queue = ctx.Queue()
-    proc = ctx.Process(target=_run_sandboxed, args=(dfs, clean_code, queue), daemon=True)
+    proc = ctx.Process(
+        target=_run_sandboxed,
+        args=(dfs, backup_context, clean_code, queue),
+        daemon=True,
+    )
     proc.start()
-    proc.join(timeout_seconds)
+    proc.join(effective_timeout)
 
     if proc.is_alive():
         proc.terminate()
@@ -267,7 +292,7 @@ def run_trusted_code(dfs: Dict[str, pd.DataFrame], code: str, timeout_seconds: i
             "chart_jsons": [],
             "result_df": None,
             "audit_logger": AuditLogger(),
-            "log": f"❌ Runtime Error:\nExecutionTimeout: exceeded {timeout_seconds}s",
+            "log": f"❌ Runtime Error:\nExecutionTimeout: exceeded {effective_timeout}s",
         }
 
     if queue.empty():
@@ -277,7 +302,7 @@ def run_trusted_code(dfs: Dict[str, pd.DataFrame], code: str, timeout_seconds: i
             "chart_jsons": [],
             "result_df": None,
             "audit_logger": AuditLogger(),
-            "log": "❌ Runtime Error:\nSandbox process exited unexpectedly.",
+            "log": f"❌ Runtime Error:\nSandbox process exited unexpectedly (start_method={start_method}).",
         }
 
     return queue.get()

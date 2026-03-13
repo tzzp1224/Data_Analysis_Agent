@@ -62,6 +62,14 @@ def save_full_context_excel(
                 excluded_df.to_excel(writer, sheet_name=excluded_sheet, index=False)
                 saved_sheets.add(excluded_sheet)
 
+        # Defensive fallback: ensure workbook always has at least one visible sheet.
+        if not saved_sheets:
+            fallback_sheet = _unique_sheet_name("meta", saved_sheets)
+            pd.DataFrame(
+                {"message": ["No exportable business tables or audit records produced."]}
+            ).to_excel(writer, sheet_name=fallback_sheet, index=False)
+            saved_sheets.add(fallback_sheet)
+
 
 def save_result_with_audit(
     result_df: Optional[pd.DataFrame],

@@ -82,6 +82,37 @@ This repository now includes a focused P0 pass for reliability and engineering h
   - Added in-memory session TTL cleanup (default 4 hours).
   - Expired sessions now clean associated upload/output temp files.
 
+## P0.5 Runtime Reliability (Completed)
+
+- **macOS Process Safety**
+  - Trusted executor now defaults to multiprocessing `spawn` on macOS to avoid `fork` crashes with torch/MPS runtime.
+
+- **Configurable Execution Timeout**
+  - Trusted execution timeout is configurable via `TRUSTED_EXEC_TIMEOUT_SECONDS` (default `30`).
+  - This reduces false execution failures for heavier reconciliation/merge code paths.
+
+- **Failure Observability**
+  - When execution never succeeds, API now returns a concise `❌ Runtime Error` summary in `response_text`.
+  - Evaluator can now capture root-cause failure directly instead of only downstream assertion failures.
+
+## P1 Skillization (In Progress)
+
+- Added lightweight deterministic skill routes for:
+  - `L1` hygiene
+  - `L1+L2` hygiene + master-data alignment
+  - `L3` reconciliation
+- Introduced `app/skills/engine.py` as the single dispatch boundary to keep API orchestration and skill logic decoupled.
+- Skill-first path runs before free-form Python generation; non-matching tasks still fall back to workflow.
+- Added semantic layer for tabular robustness:
+  - `app/services/semantic_taxonomy.py`: extensible column/row type taxonomy.
+  - `app/services/semantic_profile.py`: column name + value-distribution profiling.
+  - `app/services/semantic_infer.py`: LLM-first semantic inference with heuristic fallback.
+- Fallback policy is explicit:
+  - If semantic inference falls back to heuristics, audit logs include warning and cleaning strategy becomes conservative.
+- Reconciliation guardrails:
+  - Before L3 reconciliation, system validates key semantic columns (ID/amount).
+  - If any input table has no recognizable amount column, workflow stops and returns clear user-facing guidance instead of proceeding blindly.
+
 ## Installation
 
 ### Prerequisites
@@ -160,6 +191,18 @@ Run automated benchmark (batch by manifest + snapshot assertions):
 ```bash
 python golden_dataset/run_evaluation.py --api-url http://localhost:8000
 ```
+
+The evaluator now performs a preflight check on `GET /health` before running cases.
+If `GOOGLE_API_KEY` is missing in the backend environment, evaluation exits early with a clear error.
+
+### Troubleshooting
+
+- `python: can't open file .../golden_dataset/run_evaluation.py`:
+  Run command from project root: `/Users/dexter/Documents/Dexter_Work/Data_Analysis_Agent`.
+- All cases fail with `latency=0.00s`:
+  Backend API likely unreachable. Confirm `uvicorn app.server:app --reload --port 8000` is running.
+- Preflight reports `LLM key is not ready`:
+  Set `GOOGLE_API_KEY` in the same shell/session where `uvicorn` is started.
 
 ## Roadmap
 

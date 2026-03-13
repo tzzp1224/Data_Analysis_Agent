@@ -69,7 +69,8 @@ def main():
         return
 
     # 3. 初始化 Workflow
-    app = create_workflow(dfs_context)
+    backups_context = {name: df.copy(deep=True) for name, df in dfs_context.items()}
+    app = create_workflow(dfs_context, backups_context)
     
     # 清理可能存在的旧状态
     if '__last_result_df__' in dfs_context: del dfs_context['__last_result_df__']

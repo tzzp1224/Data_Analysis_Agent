@@ -2,7 +2,7 @@ import pandas as pd
 import re
 import ast
 import json
-from typing import TypedDict, Annotated, List, Union, Dict, Any
+from typing import TypedDict, Annotated, List, Union, Dict, Any, Optional
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -10,6 +10,8 @@ from langgraph.graph import StateGraph, END
 from app.services.llm_factory import get_llm
 from app.services.trusted_exec import run_trusted_code
 import operator
+
+MAX_EXEC_RETRIES = 3
 
 # ==========================================
 # 0. 基础工具
@@ -112,9 +114,9 @@ class AgentState(TypedDict):
 # ==========================================
 # 2. 代码执行器 (支持 result_df 捕获)
 # ==========================================
-def execute_code(dfs: Dict[str, pd.DataFrame], code: str) -> dict:
+def execute_code(dfs: Dict[str, pd.DataFrame], code: str, backups_context: Optional[Dict[str, pd.DataFrame]] = None) -> dict:
     clean_code = clean_code_string(code)
-    return run_trusted_code(dfs, clean_code)
+    return run_trusted_code(dfs, clean_code, backups=backups_context)
 
 # ==========================================
 # 3. Nodes
@@ -448,12 +450,12 @@ def python_worker_node(state: AgentState, dfs_context: dict, mode: str = "custom
     
     return {"messages": [response]}
 
-def executor_node(state: AgentState, dfs_context: dict):
+def executor_node(state: AgentState, dfs_context: dict, backups_context: Optional[dict] = None):
     messages = state['messages']
     code = messages[-1].content
     print(f"\n⚡ 执行代码:\n{clean_code_string(code)[:80]}...")
     
-    result = execute_code(dfs_context, code)
+    result = execute_code(dfs_context, code, backups_context=backups_context)
     
     updates = {}
     if result['success']:
@@ -488,7 +490,8 @@ def router_logic(state: AgentState):
     error_count = state.get("error_count", 0)
     messages = state.get("messages", [])
     if messages and error_count > 0:
-        if error_count > 3: return END
+        if error_count >= MAX_EXEC_RETRIES:
+            return END
         return 'python_worker'
     if decision == 'python_worker': return 'python_worker'
     if decision == 'auto_eda': return 'auto_eda'
@@ -497,22 +500,25 @@ def router_logic(state: AgentState):
 
 def executor_router(state: AgentState):
     messages = state.get("messages", [])
+    error_count = state.get("error_count", 0)
     if not messages: return "supervisor"
     last_content = str(messages[-1].content)
-    if "❌ Runtime Error" in last_content: return "retry"
+    if "❌ Runtime Error" in last_content:
+        if error_count >= MAX_EXEC_RETRIES:
+            return "end"
+        return "retry"
     if "WORKER_DONE" in last_content: return "end"
-    # ✅ 修复点：如果既没报错，又没DONE，不要死循环回 Worker。
-    # 而是回到 Supervisor，让 LLM 决定是继续还是结束（通常 LLM 看到 log 会觉得完成了）
-    return "supervisor"
+    # 成功执行但未显式打印结束信号时，直接结束本轮，避免重复调用导致长耗时或递归触顶。
+    return "end"
 
-def create_workflow(dfs_context: dict):
+def create_workflow(dfs_context: dict, backups_context: Optional[dict] = None):
     from functools import partial
     workflow = StateGraph(AgentState)
     workflow.add_node("supervisor", partial(supervisor_node, dfs_context=dfs_context))
     workflow.add_node("general_chat", general_chat_node)
     workflow.add_node("python_worker", partial(python_worker_node, dfs_context=dfs_context, mode='custom'))
     workflow.add_node("auto_eda", partial(python_worker_node, dfs_context=dfs_context, mode='auto_eda'))
-    workflow.add_node("executor", partial(executor_node, dfs_context=dfs_context))
+    workflow.add_node("executor", partial(executor_node, dfs_context=dfs_context, backups_context=backups_context))
     
     workflow.set_entry_point("supervisor")
     workflow.add_conditional_edges("supervisor", router_logic, {"python_worker": "python_worker", "auto_eda": "auto_eda", "general_chat": "general_chat", END: END})

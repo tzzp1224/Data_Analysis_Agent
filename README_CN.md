@@ -81,6 +81,37 @@
   - 增加内存会话 TTL 清理（默认 4 小时）。
   - 会话过期时同步清理关联上传/导出临时文件，降低资源泄漏风险。
 
+## P0.5 运行稳定性修复（已完成）
+
+- **macOS 进程稳定性**
+  - 可信执行器在 macOS 下默认使用多进程 `spawn`，规避 torch/MPS 栈在 `fork` 场景下的崩溃问题。
+
+- **可配置执行超时**
+  - 执行超时支持通过 `TRUSTED_EXEC_TIMEOUT_SECONDS` 配置（默认 `30` 秒）。
+  - 降低复杂合并/对账代码的误超时概率。
+
+- **错误可观测性**
+  - 当执行始终未成功时，API 会在 `response_text` 中返回简要 `❌ Runtime Error` 摘要。
+  - 评测侧可直接看到根因，而不再只看到后置断言失败。
+
+## P1 Skill 化（进行中）
+
+- 已新增轻量确定性 skill 路由：
+  - `L1` 数据体检
+  - `L1+L2` 清洗 + 主数据对齐
+  - `L3` 财务对账
+- 新增 `app/skills/engine.py` 作为统一分发边界，保持 API 编排层与 skill 实现层解耦。
+- 命中 skill 时优先走确定性执行；未命中时回退到现有 workflow。
+- 新增语义层，提升 CSV/Excel 泛化能力：
+  - `app/services/semantic_taxonomy.py`：可扩展列类型/行类型定义。
+  - `app/services/semantic_profile.py`：列名 + 值分布画像。
+  - `app/services/semantic_infer.py`：LLM 主判定 + 启发式兜底。
+- 兜底策略显式可见：
+  - 当语义识别回退到启发式时，会在审计日志中提示，并自动切换保守清洗策略。
+- 对账前置校验：
+  - L3 对账前会检查关键语义列（主键/金额）。
+  - 若任一输入文件未识别到金额列，会直接提示用户修复，不会继续执行错误对账流程。
+
 ## 安装与部署
 
 ### 环境要求
@@ -159,6 +190,18 @@ python golden_dataset/build_golden_dataset.py
 ```bash
 python golden_dataset/run_evaluation.py --api-url http://localhost:8000
 ```
+
+评测脚本会在执行前自动调用 `GET /health` 做预检。
+如果后端环境未正确加载 `GOOGLE_API_KEY`，会直接失败并给出明确提示。
+
+### 常见问题排查
+
+- `python: can't open file .../golden_dataset/run_evaluation.py`：
+  当前目录不在项目根目录，请切换到 `/Users/dexter/Documents/Dexter_Work/Data_Analysis_Agent` 再执行。
+- 所有 case 都 `latency=0.00s`：
+  通常是后端未启动或地址错误，先确认 `uvicorn app.server:app --reload --port 8000` 正常运行。
+- 预检提示 `LLM key is not ready`：
+  在启动 `uvicorn` 的同一个 shell 环境中设置并生效 `GOOGLE_API_KEY`。
 
 ## 待优化方向 (Roadmap)
 
