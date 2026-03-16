@@ -1,6 +1,6 @@
 {
   "dataset_name": "Agentic Finance Golden Dataset",
-  "version": "v1.0.8",
+  "version": "v1.0.9",
   "generated_at_utc": "2026-03-11T09:00:58Z",
   "version_policy": {
     "patch": "v1.0.x: only metadata/evaluation tooling/expectation updates; no case data content changes",

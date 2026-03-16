@@ -8,6 +8,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langgraph.graph import StateGraph, END
 from app.services.llm_factory import get_llm
+from app.services.semantic_contract import get_semantic_contract
 from app.services.trusted_exec import run_trusted_code
 import operator
 
@@ -63,6 +64,7 @@ def sanitize_schema_text(value: Any, max_len: int = 80) -> str:
 
 def build_schema_context(dfs: Dict[str, pd.DataFrame]) -> str:
     blocks = []
+    semantic_contract = get_semantic_contract(dfs)
     for name, df in dfs.items():
         if name.startswith("__"):
             continue
@@ -94,6 +96,18 @@ def build_schema_context(dfs: Dict[str, pd.DataFrame]) -> str:
             "null_counts": null_counts,
             "sample_rows": sample_rows,
         }
+        table_sem = semantic_contract.get(name)
+        if table_sem is not None:
+            payload["semantic_columns"] = [
+                {
+                    "name": sanitize_schema_text(col.name, max_len=60),
+                    "label": col.label,
+                    "confidence": round(float(col.confidence), 3),
+                }
+                for col in table_sem.columns[:20]
+            ]
+            if table_sem.warnings:
+                payload["semantic_warnings"] = [sanitize_schema_text(w, max_len=120) for w in table_sem.warnings[:3]]
         blocks.append(f"\n=== File: {safe_name} ===\n{json.dumps(payload, ensure_ascii=False)}")
 
     return "\n".join(blocks) if blocks else "无可用数据。"

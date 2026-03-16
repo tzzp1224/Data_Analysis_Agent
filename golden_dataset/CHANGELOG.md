@@ -2,6 +2,15 @@
 
 All notable changes to the golden dataset are documented in this file.
 
+## [v1.0.9] - 2026-03-13
+- Introduced explicit cleaning-policy layer in semantic L1 pipeline:
+  - Default mode is `conservative` to reduce accidental data loss on unknown real-world files.
+  - `strict` mode is supported via user instruction keywords for aggressive anomaly removal.
+- Unified destructive-action gating:
+  - Negative amount/quantity removal now depends on semantic confidence + policy, not hardcoded behavior.
+  - Summary/metadata row removal also depends on policy, with audit trace for every exclusion/warning.
+- Goal: optimize for objective data safety and explainability rather than benchmark-specific tuning.
+
 ## [v1.0.8] - 2026-03-13
 - Fixed ingestion-case over-cleaning mismatch:
   - Negative values in quantity-like columns (`数量/qty/count`) are now treated as warnings (kept in table), not hard deletions.

@@ -68,7 +68,7 @@ This repository now includes a focused P0 pass for reliability and engineering h
 
 - **CSV-Compatible Ingestion**
   - Ingestion now branches by file type (`excel` / `csv`) instead of assuming Excel only.
-  - CSV mode uses rule-based defaults (header row = 0), delimiter sniffing, and encoding fallback.
+  - CSV mode now supports delimiter sniffing, encoding fallback, and automatic header row detection (LLM-first + heuristic fallback).
 
 - **Workflow Prompt/Tool Consistency**
   - Removed reference to unavailable `vector_match` in worker prompt.
@@ -101,17 +101,24 @@ This repository now includes a focused P0 pass for reliability and engineering h
   - `L1` hygiene
   - `L1+L2` hygiene + master-data alignment
   - `L3` reconciliation
+  - `L4` trend visualization
 - Introduced `app/skills/engine.py` as the single dispatch boundary to keep API orchestration and skill logic decoupled.
 - Skill-first path runs before free-form Python generation; non-matching tasks still fall back to workflow.
 - Added semantic layer for tabular robustness:
   - `app/services/semantic_taxonomy.py`: extensible column/row type taxonomy.
   - `app/services/semantic_profile.py`: column name + value-distribution profiling.
   - `app/services/semantic_infer.py`: LLM-first semantic inference with heuristic fallback.
+- Added shared semantic contract cache:
+  - `app/services/semantic_contract.py` builds/reuses one semantic contract per request.
+  - Skills and workflow now consume the same semantic contract, avoiding duplicated inference.
 - Fallback policy is explicit:
   - If semantic inference falls back to heuristics, audit logs include warning and cleaning strategy becomes conservative.
-- Reconciliation guardrails:
-  - Before L3 reconciliation, system validates key semantic columns (ID/amount).
-  - If any input table has no recognizable amount column, workflow stops and returns clear user-facing guidance instead of proceeding blindly.
+- Cleaning policy is explicit and user-steerable:
+  - Default `conservative` mode prioritizes data preservation (warn-first).
+  - `strict` mode can be triggered by user instruction for aggressive anomaly removal.
+- Required-column guardrails:
+  - Before `L2`/`L3`/`L4`, system checks critical semantic columns and blocks execution when missing.
+  - Blocked responses include current columns + semantic evidence to guide user correction.
 
 ## Installation
 

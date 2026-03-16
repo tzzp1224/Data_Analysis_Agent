@@ -14,6 +14,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.services.ingestion import load_file
 from app.services.exporter import save_full_context_excel
+from app.services.semantic_contract import ensure_semantic_contract, invalidate_semantic_contract
 from app.services.workflow import create_workflow
 from app.core.config import settings
 from app.skills.router import route_skill
@@ -212,6 +213,7 @@ async def upload_files(session_id: str = Form(...), files: List[UploadFile] = Fi
             remove_file_quietly(file_path)
             raise HTTPException(status_code=400, detail=f"Failed to load {safe_filename}: {str(e)}")
 
+    invalidate_semantic_contract(session.dfs_context)
     session.workflow_app = create_workflow(session.dfs_context, session.backups)
     return {"message": "Upload success", "details": loaded_info}
 
@@ -253,6 +255,7 @@ async def chat(request: ChatRequest):
         if str(key).startswith("__backup_"):
             del session.dfs_context[key]
 
+    ensure_semantic_contract(session.dfs_context, user_instruction=request.message)
     skill_name = route_skill(request.message, session.dfs_context)
     if skill_name:
         skill_result = execute_skill(skill_name, session.dfs_context, request.message)

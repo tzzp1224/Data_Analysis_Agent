@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import pandas as pd
 
-from app.services.semantic_infer import ColumnSemantic, SemanticInferenceResult, infer_dataframe_semantics
+from app.services.semantic_contract import ensure_semantic_contract
+from app.services.semantic_infer import SemanticInferenceResult, infer_dataframe_semantics
+from app.skills.column_guard import (
+    RequiredColumnSpec,
+    build_missing_columns_message,
+    resolve_required_columns,
+)
 from app.skills.contracts import SkillResult
 from app.utils.tools import AuditLogger, smart_reconcile
 
@@ -14,16 +20,6 @@ SYS_KEY_TOKENS = ("外部流水号", "外部流水", "流水号", "交易号", "
 SYS_AMOUNT_TOKENS = ("应收金额", "金额", "应收", "总额", "amount")
 BANK_KEY_TOKENS = ("交易流水", "银行流水", "流水号", "外部流水号", "参考号")
 BANK_AMOUNT_TOKENS = ("到账金额", "入账金额", "金额", "交易金额", "amount")
-
-
-def _find_column(columns: Iterable[str], tokens: Iterable[str]) -> Optional[str]:
-    text_cols = [str(col) for col in columns]
-    for token in tokens:
-        for col in text_cols:
-            if token.lower() in col.lower():
-                return col
-    return None
-
 
 def _clean_amount(series: pd.Series) -> pd.Series:
     return pd.to_numeric(
@@ -45,18 +41,6 @@ def _parse_tolerance(instruction: str) -> float:
     if yuan_match and ("容差" in text or "忽略" in text):
         return float(yuan_match.group(1))
     return 0.01
-
-
-def _pick_semantic_column(
-    sem: SemanticInferenceResult,
-    desired_label: str,
-    min_confidence: float,
-) -> Optional[str]:
-    candidates = [c for c in sem.columns if c.label == desired_label and c.confidence >= min_confidence]
-    if not candidates:
-        return None
-    best = sorted(candidates, key=lambda x: x.confidence, reverse=True)[0]
-    return best.name
 
 
 def _table_role_score(table_name: str, sem: SemanticInferenceResult) -> Tuple[float, float]:
@@ -82,6 +66,7 @@ def _table_role_score(table_name: str, sem: SemanticInferenceResult) -> Tuple[fl
 def _pick_tables(
     dfs_context: Dict[str, pd.DataFrame],
     instruction: str,
+    semantic_contract: Optional[Dict[str, SemanticInferenceResult]] = None,
 ) -> Tuple[
     Optional[str],
     Optional[pd.DataFrame],
@@ -98,10 +83,17 @@ def _pick_tables(
     if len(business_tables) < 2:
         return None, None, None, None, None, None
 
-    semantics = {
-        name: infer_dataframe_semantics(df, table_name=name, user_instruction=instruction)
-        for name, df in business_tables
-    }
+    contract = semantic_contract or ensure_semantic_contract(
+        dfs_context,
+        user_instruction=instruction,
+    )
+    semantics = {}
+    for name, df in business_tables:
+        sem = contract.get(name)
+        if sem is None:
+            sem = infer_dataframe_semantics(df, table_name=name, user_instruction=instruction)
+            contract[name] = sem
+        semantics[name] = sem
     scored = []
     for name, df in business_tables:
         sys_score, bank_score = _table_role_score(name, semantics[name])
@@ -117,27 +109,22 @@ def _pick_tables(
         return None, None, None, None, None, None
     return sys_name, sys_df, sys_sem, bank_name, bank_df, bank_sem
 
-
-def _format_missing_column_message(
-    table_name: str,
-    missing_type: str,
-    df: pd.DataFrame,
-    sem: SemanticInferenceResult,
-) -> str:
-    columns_preview = ", ".join([str(c) for c in list(df.columns)[:12]])
-    sem_preview = ", ".join([f"{c.name}:{c.label}({c.confidence:.2f})" for c in sem.columns[:8]])
-    return (
-        f"无法执行对账：文件 `{table_name}` 未识别到可用的{missing_type}列。\n\n"
-        f"当前列: {columns_preview or '无'}\n\n"
-        f"语义识别结果(前8列): {sem_preview or '无'}\n\n"
-        "请补充/明确该列后再执行对账（例如在列名中包含金额或交易流水语义）。"
-    )
-
-
-def run_l3_reconcile_skill(dfs_context: Dict[str, pd.DataFrame], instruction: str) -> SkillResult:
+def run_l3_reconcile_skill(
+    dfs_context: Dict[str, pd.DataFrame],
+    instruction: str,
+    semantic_contract: Optional[Dict[str, SemanticInferenceResult]] = None,
+) -> SkillResult:
     audit = AuditLogger()
     try:
-        sys_name, sys_df, sys_sem, bank_name, bank_df, bank_sem = _pick_tables(dfs_context, instruction=instruction)
+        contract = semantic_contract or ensure_semantic_contract(
+            dfs_context,
+            user_instruction=instruction,
+        )
+        sys_name, sys_df, sys_sem, bank_name, bank_df, bank_sem = _pick_tables(
+            dfs_context,
+            instruction=instruction,
+            semantic_contract=contract,
+        )
         if sys_df is None or bank_df is None or sys_sem is None or bank_sem is None:
             return SkillResult(
                 handled=True,
@@ -154,35 +141,71 @@ def run_l3_reconcile_skill(dfs_context: Dict[str, pd.DataFrame], instruction: st
             for warning in sem.warnings[:2]:
                 semantic_notes.append(f"{sem_name}: {warning}")
 
-        sys_key = _pick_semantic_column(sys_sem, "id", min_confidence=0.55) or _find_column(sys_df.columns, SYS_KEY_TOKENS)
-        bank_key = _pick_semantic_column(bank_sem, "id", min_confidence=0.55) or _find_column(bank_df.columns, BANK_KEY_TOKENS)
-        sys_amount = _pick_semantic_column(sys_sem, "amount", min_confidence=0.6) or _find_column(sys_df.columns, SYS_AMOUNT_TOKENS)
-        bank_amount = _pick_semantic_column(bank_sem, "amount", min_confidence=0.6) or _find_column(bank_df.columns, BANK_AMOUNT_TOKENS)
+        sys_specs = [
+            RequiredColumnSpec(
+                key="reconcile_key",
+                display_name="系统侧流水/主键列",
+                semantic_labels=("id",),
+                min_confidence=0.55,
+                name_tokens=SYS_KEY_TOKENS,
+            ),
+            RequiredColumnSpec(
+                key="reconcile_amount",
+                display_name="系统侧金额列",
+                semantic_labels=("amount",),
+                min_confidence=0.6,
+                name_tokens=SYS_AMOUNT_TOKENS,
+            ),
+        ]
+        bank_specs = [
+            RequiredColumnSpec(
+                key="reconcile_key",
+                display_name="银行侧流水/主键列",
+                semantic_labels=("id",),
+                min_confidence=0.55,
+                name_tokens=BANK_KEY_TOKENS,
+            ),
+            RequiredColumnSpec(
+                key="reconcile_amount",
+                display_name="银行侧金额列",
+                semantic_labels=("amount",),
+                min_confidence=0.6,
+                name_tokens=BANK_AMOUNT_TOKENS,
+            ),
+        ]
+        sys_resolved, sys_missing = resolve_required_columns(sys_df, sys_sem, sys_specs)
+        if sys_missing:
+            return SkillResult(
+                handled=True,
+                response_text=build_missing_columns_message(
+                    skill_name="L3 财务对账",
+                    table_name=sys_name,
+                    df=sys_df,
+                    sem=sys_sem,
+                    missing_specs=sys_missing,
+                    guidance="请补充系统侧流水号与金额列后再执行对账。",
+                ),
+                audit=audit,
+            )
+        bank_resolved, bank_missing = resolve_required_columns(bank_df, bank_sem, bank_specs)
+        if bank_missing:
+            return SkillResult(
+                handled=True,
+                response_text=build_missing_columns_message(
+                    skill_name="L3 财务对账",
+                    table_name=bank_name,
+                    df=bank_df,
+                    sem=bank_sem,
+                    missing_specs=bank_missing,
+                    guidance="请补充银行侧流水号与金额列后再执行对账。",
+                ),
+                audit=audit,
+            )
 
-        if not sys_amount:
-            return SkillResult(
-                handled=True,
-                response_text=_format_missing_column_message(sys_name, "金额", sys_df, sys_sem),
-                audit=audit,
-            )
-        if not bank_amount:
-            return SkillResult(
-                handled=True,
-                response_text=_format_missing_column_message(bank_name, "金额", bank_df, bank_sem),
-                audit=audit,
-            )
-        if not sys_key:
-            return SkillResult(
-                handled=True,
-                response_text=_format_missing_column_message(sys_name, "主键/流水", sys_df, sys_sem),
-                audit=audit,
-            )
-        if not bank_key:
-            return SkillResult(
-                handled=True,
-                response_text=_format_missing_column_message(bank_name, "主键/流水", bank_df, bank_sem),
-                audit=audit,
-            )
+        sys_key = sys_resolved["reconcile_key"]
+        bank_key = bank_resolved["reconcile_key"]
+        sys_amount = sys_resolved["reconcile_amount"]
+        bank_amount = bank_resolved["reconcile_amount"]
 
         tolerance = _parse_tolerance(instruction)
         audit.info("L3Skill", f"命中语义增强对账流程，容差={tolerance}", affected_rows=0)
