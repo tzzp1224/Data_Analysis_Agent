@@ -203,11 +203,11 @@ def _infer_with_llm(profile_payload: dict, user_instruction: str) -> Optional[di
 - data_row, summary_row, metadata_row, empty_row, unknown
 
 返回 JSON（不要解释）:
-{
-  "columns": [{"name":"列名","label":"amount","confidence":0.0,"reason":"简短理由"}],
-  "rows": [{"row_index":0,"label":"data_row","confidence":0.0,"reason":"简短理由"}],
+{{
+  "columns": [{{"name":"列名","label":"amount","confidence":0.0,"reason":"简短理由"}}],
+  "rows": [{{"row_index":0,"label":"data_row","confidence":0.0,"reason":"简短理由"}}],
   "warnings": ["可选风险提示"]
-}
+}}
 """.strip(),
             ),
             (
@@ -332,4 +332,3 @@ def infer_dataframe_semantics(
             warnings=[f"语义判定回退启发式: {type(exc).__name__}: {exc}"],
             used_fallback=True,
         )
-
