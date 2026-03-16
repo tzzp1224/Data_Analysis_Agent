@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Tuple
 
 import pandas as pd
-from rapidfuzz import fuzz, process
 
 from app.services.semantic_contract import ensure_semantic_contract
 from app.services.semantic_infer import (
@@ -14,13 +13,9 @@ from app.services.semantic_infer import (
     SemanticInferenceResult,
     infer_dataframe_semantics,
 )
-from app.skills.column_guard import (
-    RequiredColumnSpec,
-    build_missing_columns_message,
-    resolve_required_columns,
-)
+from app.skills.merge_planner import MergePlan, propose_merge_plan
 from app.skills.contracts import SkillResult
-from app.utils.tools import AuditLogger
+from app.utils.tools import AuditLogger, smart_merge
 
 
 NUMERIC_COL_TOKENS = ("金额", "单价", "数量", "总额", "应收", "到账", "price", "qty", "amount", "total")
@@ -30,6 +25,9 @@ SALES_NAME_TOKENS = ("客户名称", "客户", "company", "client")
 MASTER_NAME_TOKENS = ("标准公司名", "公司名称", "客户主数据", "master")
 STRICT_CLEANING_KEYWORDS = ("严格清洗", "强清洗", "删除异常", "剔除异常", "高质量清洗", "hard clean")
 CONSERVATIVE_CLEANING_KEYWORDS = ("保守", "仅审计", "不删", "保留异常", "review")
+MERGE_PLAN_KEY = "__pending_merge_plan__"
+MERGE_CONFIRM_KEYWORDS = ("确认", "同意", "可以合并", "执行合并", "继续", "confirm", "yes", "ok")
+MERGE_REJECT_KEYWORDS = ("取消", "否", "不要", "no", "重新选择", "换主键")
 
 
 @dataclass(frozen=True)
@@ -316,23 +314,38 @@ def _pick_sales_master_tables(
     return sales_name, master_name
 
 
-def _fuzzy_map_entities(values: pd.Series, standards: pd.Series) -> pd.Series:
-    left_values = values.fillna("").astype(str)
-    right_values = standards.dropna().astype(str).unique().tolist()
-    if not right_values:
-        return pd.Series([None] * len(left_values), index=left_values.index)
+def _is_merge_confirmed(text: str) -> bool:
+    value = str(text or "").lower()
+    return any(token in value for token in MERGE_CONFIRM_KEYWORDS)
 
-    mapped = []
-    for item in left_values:
-        if not item:
-            mapped.append(None)
-            continue
-        result = process.extractOne(item, right_values, scorer=fuzz.WRatio)
-        if result and result[1] >= 70:
-            mapped.append(result[0])
-        else:
-            mapped.append(None)
-    return pd.Series(mapped, index=left_values.index)
+
+def _is_merge_rejected(text: str) -> bool:
+    value = str(text or "").lower()
+    return any(token in value for token in MERGE_REJECT_KEYWORDS)
+
+
+def _format_merge_plan(plan: MergePlan, sales_name: str, master_name: str) -> str:
+    notes = "\n".join(f"- {n}" for n in plan.validation_notes) if plan.validation_notes else "- 无"
+    return (
+        "### 🔐 Merge 前确认\n\n"
+        f"已完成 L1 清洗。为了保证对齐精度，系统先产出主键计划，请你确认后再执行合并。\n\n"
+        f"- 左表: `{sales_name}`\n"
+        f"- 右表: `{master_name}`\n"
+        f"- 建议主键: `{plan.left_key}` ↔ `{plan.right_key}`\n"
+        f"- 键类型: `{plan.key_type}`\n"
+        f"- 置信度: `{plan.confidence:.2f}`\n"
+        f"- 左键质量: 非空率 {plan.left_quality.non_null_ratio:.2f}, 唯一率 {plan.left_quality.unique_ratio:.2f}\n"
+        f"- 右键质量: 非空率 {plan.right_quality.non_null_ratio:.2f}, 唯一率 {plan.right_quality.unique_ratio:.2f}\n"
+        f"- 精确交集率: {plan.overlap_ratio:.2f}\n"
+        f"- 规划理由: {plan.reason or '无'}\n"
+        f"- 风险提示:\n{notes}\n\n"
+        "若同意请回复：`确认合并`。\n"
+        "若不同意请回复：`取消合并`（系统将不执行 merge）。"
+    )
+
+
+def _normalize_deterministic_key(series: pd.Series) -> pd.Series:
+    return series.fillna("").astype(str).str.strip()
 
 
 def _run_l1_hygiene(
@@ -443,78 +456,132 @@ def run_l1_l2_hygiene_merge_skill(
 
         sales_df = dfs_context[sales_name].copy()
         master_df = dfs_context[master_name].copy()
-        sales_sem = contract.get(sales_name) or infer_dataframe_semantics(
-            sales_df,
-            table_name=sales_name,
-            user_instruction=user_instruction,
-        )
-        master_sem = contract.get(master_name) or infer_dataframe_semantics(
-            master_df,
-            table_name=master_name,
-            user_instruction=user_instruction,
-        )
-        contract[sales_name] = sales_sem
-        contract[master_name] = master_sem
-
-        sales_specs = [
-            RequiredColumnSpec(
-                key="entity_key",
-                display_name="销售侧主体标识列",
-                semantic_labels=("id", "text"),
-                min_confidence=0.45,
-                name_tokens=SALES_NAME_TOKENS,
-            )
-        ]
-        master_specs = [
-            RequiredColumnSpec(
-                key="entity_key",
-                display_name="主数据侧主体标识列",
-                semantic_labels=("id", "text"),
-                min_confidence=0.45,
-                name_tokens=MASTER_NAME_TOKENS,
-            )
-        ]
-
-        sales_resolved, sales_missing = resolve_required_columns(sales_df, sales_sem, sales_specs)
-        if sales_missing:
-            block_msg = build_missing_columns_message(
-                skill_name="L2 实体对齐",
+        sales_sem = contract.get(sales_name)
+        if sales_sem is None:
+            sales_sem = infer_dataframe_semantics(
+                sales_df,
                 table_name=sales_name,
-                df=sales_df,
-                sem=sales_sem,
-                missing_specs=sales_missing,
-                guidance="请补充销售侧客户/主体标识列（如 客户名称、客户ID）。",
+                user_instruction=user_instruction,
             )
-            audit.info("L2阻断", block_msg.splitlines()[0], affected_rows=0)
-            return SkillResult(handled=True, response_text=block_msg, audit=audit)
-
-        master_resolved, master_missing = resolve_required_columns(master_df, master_sem, master_specs)
-        if master_missing:
-            block_msg = build_missing_columns_message(
-                skill_name="L2 实体对齐",
+            contract[sales_name] = sales_sem
+        master_sem = contract.get(master_name)
+        if master_sem is None:
+            master_sem = infer_dataframe_semantics(
+                master_df,
                 table_name=master_name,
-                df=master_df,
-                sem=master_sem,
-                missing_specs=master_missing,
-                guidance="请补充主数据侧标准实体列（如 标准公司名、客户主键）。",
+                user_instruction=user_instruction,
             )
-            audit.info("L2阻断", block_msg.splitlines()[0], affected_rows=0)
-            return SkillResult(handled=True, response_text=block_msg, audit=audit)
+            contract[master_name] = master_sem
 
-        sales_key = sales_resolved["entity_key"]
-        master_key = master_resolved["entity_key"]
-        mapped = _fuzzy_map_entities(sales_df[sales_key], master_df[master_key])
-        sales_df["_matched_master_name"] = mapped
-        merged_df = pd.merge(
-            sales_df,
-            master_df,
-            left_on="_matched_master_name",
-            right_on=master_key,
-            how="left",
-        )
+        if _is_merge_rejected(user_instruction):
+            dfs_context.pop(MERGE_PLAN_KEY, None)
+            audit.info("L2取消", "用户取消合并，未执行 merge。", affected_rows=0)
+            return SkillResult(
+                handled=True,
+                response_text="已取消本次合并。若要继续，请重新发起合并指令。",
+                audit=audit,
+            )
+
+        pending_payload = dfs_context.get(MERGE_PLAN_KEY)
+        pending_plan: Optional[MergePlan] = None
+        if (
+            isinstance(pending_payload, dict)
+            and pending_payload.get("sales_name") == sales_name
+            and pending_payload.get("master_name") == master_name
+            and isinstance(pending_payload.get("plan"), dict)
+        ):
+            pending_plan = MergePlan.from_dict(pending_payload["plan"])
+
+        if pending_plan is None:
+            plan = propose_merge_plan(
+                left_name=sales_name,
+                right_name=master_name,
+                left_df=sales_df,
+                right_df=master_df,
+                left_semantic=sales_sem,
+                right_semantic=master_sem,
+                user_instruction=user_instruction,
+            )
+            if not plan.valid:
+                audit.info("L2阻断", "主键规划失败，未执行 merge。", affected_rows=0)
+                details = "\n".join(f"- {item}" for item in plan.validation_notes) or "- 未通过主键质量校验"
+                return SkillResult(
+                    handled=True,
+                    response_text=(
+                        "L2已阻断：未找到可靠的合并主键，系统已停止 merge。\n\n"
+                        f"{details}\n\n"
+                        "请明确提供主键列，或修复关键列质量后再尝试。"
+                    ),
+                    audit=audit,
+                )
+            dfs_context[MERGE_PLAN_KEY] = {
+                "sales_name": sales_name,
+                "master_name": master_name,
+                "plan": plan.to_dict(),
+            }
+            audit.info(
+                "L2预执行",
+                f"已生成 merge 主键计划: {plan.left_key} ↔ {plan.right_key} ({plan.key_type})，等待用户确认。",
+                affected_rows=0,
+            )
+            response_lines = [
+                "### 💡 分析结论",
+                "",
+                "已执行语义增强的 L1 数据体检流程，并输出审计日志。",
+                f"当前清洗策略：`{policy.mode}`。",
+                _format_merge_plan(plan, sales_name=sales_name, master_name=master_name),
+            ]
+            if semantic_notes:
+                response_lines.append("⚠️ 语义提示:\n" + "\n".join(f"- {note}" for note in semantic_notes[:5]))
+            return SkillResult(handled=True, response_text="\n\n".join(response_lines), audit=audit)
+
+        if not _is_merge_confirmed(user_instruction):
+            return SkillResult(
+                handled=True,
+                response_text=(
+                    _format_merge_plan(
+                        pending_plan,
+                        sales_name=sales_name,
+                        master_name=master_name,
+                    )
+                ),
+                audit=audit,
+            )
+
+        sales_key = pending_plan.left_key
+        master_key = pending_plan.right_key
+        key_type = pending_plan.key_type
+        dfs_context.pop(MERGE_PLAN_KEY, None)
+
+        if key_type == "entity_name":
+            merged_df = smart_merge(
+                sales_df,
+                master_df,
+                left_on=sales_key,
+                right_on=master_key,
+                logger=audit,
+            )
+        else:
+            left_norm = sales_df.copy()
+            right_norm = master_df.copy()
+            left_norm[sales_key] = _normalize_deterministic_key(left_norm[sales_key])
+            right_norm[master_key] = _normalize_deterministic_key(right_norm[master_key])
+            merged_df = pd.merge(
+                left_norm,
+                right_norm,
+                left_on=sales_key,
+                right_on=master_key,
+                how="left",
+            )
+            audit.info(
+                "L2实体对齐",
+                f"按确定性主键合并: {sales_key} ↔ {master_key}",
+                affected_rows=len(merged_df),
+            )
+
         dfs_context["销售客户对齐结果.xlsx"] = merged_df
-        match_count = int(mapped.notna().sum())
-        audit.info("L2实体对齐", f"销售客户匹配 {match_count}/{len(mapped)}", affected_rows=match_count)
+        match_count = int(merged_df[master_key].notna().sum()) if master_key in merged_df.columns else 0
+        audit.info("L2匹配结果", f"销售客户匹配 {match_count}/{len(merged_df)}", affected_rows=match_count)
 
         response_lines = [
             "### 💡 分析结论",
@@ -522,8 +589,9 @@ def run_l1_l2_hygiene_merge_skill(
             "已执行语义增强的 L1 数据体检流程，并输出审计日志。",
             f"当前清洗策略：`{policy.mode}`。",
         ]
-        if merged_df is not None:
-            response_lines.append("已执行 L2 客户主数据对齐，生成 `销售客户对齐结果.xlsx`。")
+        response_lines.append(
+            f"已执行 L2 客户主数据对齐（主键: `{sales_key}` ↔ `{master_key}`，类型: `{key_type}`），生成 `销售客户对齐结果.xlsx`。"
+        )
         if semantic_notes:
             response_lines.append("⚠️ 语义提示:\n" + "\n".join(f"- {note}" for note in semantic_notes[:5]))
 

@@ -187,6 +187,7 @@ async def upload_files(session_id: str = Form(...), files: List[UploadFile] = Fi
     
     session = sessions[session_id]
     session.touch()
+    session.dfs_context.pop("__pending_merge_plan__", None)
     loaded_info = []
 
     for file in files:

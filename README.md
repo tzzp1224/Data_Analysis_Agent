@@ -119,6 +119,10 @@ This repository now includes a focused P0 pass for reliability and engineering h
 - Required-column guardrails:
   - Before `L2`/`L3`/`L4`, system checks critical semantic columns and blocks execution when missing.
   - Blocked responses include current columns + semantic evidence to guide user correction.
+- L2 merge safety gate:
+  - For merge tasks, system now proposes join keys first (LLM + key quality checks) and waits for explicit user confirmation.
+  - If no reliable key is found, merge is blocked with actionable guidance instead of forced execution.
+  - If key type is `entity_name`, alias alignment uses LLM-assisted matching; otherwise deterministic merge is used.
 
 ## Installation
 

@@ -1,5 +1,6 @@
 # .gitignore
 venv/
+.venv/
 __pycache__/
 .env
 .DS_Store
@@ -8,3 +9,7 @@ data/
 temp_uploads/
 temp_outputs/
 AGENT_E2E_EVALUATION_AUDIT_REPORT_2026-03-13.md
+
+# Runtime / evaluation artifacts
+golden_dataset/runs/
+*.log
