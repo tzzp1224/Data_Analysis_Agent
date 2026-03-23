@@ -25,7 +25,8 @@ def _business_table_items(dfs_context: Dict[str, pd.DataFrame]) -> list[Tuple[st
 def _table_signature(df: pd.DataFrame) -> dict:
     head = df.head(8).copy()
     try:
-        head_payload = head.fillna("").astype(str).to_json(orient="split", force_ascii=False)
+        sanitized = head.where(head.notna(), "")
+        head_payload = sanitized.astype(str).to_json(orient="split", force_ascii=False)
     except Exception:
         head_payload = repr(head.values.tolist())
     head_digest = hashlib.md5(head_payload.encode("utf-8")).hexdigest()[:16]
@@ -93,4 +94,3 @@ def ensure_semantic_contract(
         "table_signatures": signature,
     }
     return contract
-

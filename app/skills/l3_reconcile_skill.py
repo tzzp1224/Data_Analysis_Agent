@@ -12,7 +12,12 @@ from app.skills.column_guard import (
     build_missing_columns_message,
     resolve_required_columns,
 )
-from app.skills.contracts import SkillResult
+from app.skills.contracts import (
+    ERROR_TYPE_MISSING_REQUIRED_COLUMNS,
+    ERROR_TYPE_RUNTIME,
+    ERROR_TYPE_TABLE_SELECTION,
+    SkillResult,
+)
 from app.utils.tools import AuditLogger, smart_reconcile
 
 
@@ -130,6 +135,8 @@ def run_l3_reconcile_skill(
                 handled=True,
                 response_text="无法执行对账：未找到两张可区分的业务明细表。",
                 audit=audit,
+                blocked=True,
+                error_type=ERROR_TYPE_TABLE_SELECTION,
             )
 
         semantic_notes: list[str] = []
@@ -186,6 +193,8 @@ def run_l3_reconcile_skill(
                     guidance="请补充系统侧流水号与金额列后再执行对账。",
                 ),
                 audit=audit,
+                blocked=True,
+                error_type=ERROR_TYPE_MISSING_REQUIRED_COLUMNS,
             )
         bank_resolved, bank_missing = resolve_required_columns(bank_df, bank_sem, bank_specs)
         if bank_missing:
@@ -200,6 +209,8 @@ def run_l3_reconcile_skill(
                     guidance="请补充银行侧流水号与金额列后再执行对账。",
                 ),
                 audit=audit,
+                blocked=True,
+                error_type=ERROR_TYPE_MISSING_REQUIRED_COLUMNS,
             )
 
         sys_key = sys_resolved["reconcile_key"]
@@ -262,4 +273,5 @@ def run_l3_reconcile_skill(
             handled=True,
             audit=audit,
             error=f"{type(exc).__name__}: {exc}",
+            error_type=ERROR_TYPE_RUNTIME,
         )

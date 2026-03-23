@@ -13,8 +13,13 @@ from app.services.semantic_infer import (
     SemanticInferenceResult,
     infer_dataframe_semantics,
 )
-from app.skills.merge_planner import MergePlan, propose_merge_plan
-from app.skills.contracts import SkillResult
+from app.skills.merge_planner import propose_merge_plan
+from app.skills.contracts import (
+    ERROR_TYPE_MERGE_KEY_INVALID,
+    ERROR_TYPE_RUNTIME,
+    ERROR_TYPE_TABLE_SELECTION,
+    SkillResult,
+)
 from app.utils.tools import AuditLogger, smart_merge
 
 
@@ -25,9 +30,6 @@ SALES_NAME_TOKENS = ("客户名称", "客户", "company", "client")
 MASTER_NAME_TOKENS = ("标准公司名", "公司名称", "客户主数据", "master")
 STRICT_CLEANING_KEYWORDS = ("严格清洗", "强清洗", "删除异常", "剔除异常", "高质量清洗", "hard clean")
 CONSERVATIVE_CLEANING_KEYWORDS = ("保守", "仅审计", "不删", "保留异常", "review")
-MERGE_PLAN_KEY = "__pending_merge_plan__"
-MERGE_CONFIRM_KEYWORDS = ("确认", "同意", "可以合并", "执行合并", "继续", "confirm", "yes", "ok")
-MERGE_REJECT_KEYWORDS = ("取消", "否", "不要", "no", "重新选择", "换主键")
 
 
 @dataclass(frozen=True)
@@ -314,36 +316,6 @@ def _pick_sales_master_tables(
     return sales_name, master_name
 
 
-def _is_merge_confirmed(text: str) -> bool:
-    value = str(text or "").lower()
-    return any(token in value for token in MERGE_CONFIRM_KEYWORDS)
-
-
-def _is_merge_rejected(text: str) -> bool:
-    value = str(text or "").lower()
-    return any(token in value for token in MERGE_REJECT_KEYWORDS)
-
-
-def _format_merge_plan(plan: MergePlan, sales_name: str, master_name: str) -> str:
-    notes = "\n".join(f"- {n}" for n in plan.validation_notes) if plan.validation_notes else "- 无"
-    return (
-        "### 🔐 Merge 前确认\n\n"
-        f"已完成 L1 清洗。为了保证对齐精度，系统先产出主键计划，请你确认后再执行合并。\n\n"
-        f"- 左表: `{sales_name}`\n"
-        f"- 右表: `{master_name}`\n"
-        f"- 建议主键: `{plan.left_key}` ↔ `{plan.right_key}`\n"
-        f"- 键类型: `{plan.key_type}`\n"
-        f"- 置信度: `{plan.confidence:.2f}`\n"
-        f"- 左键质量: 非空率 {plan.left_quality.non_null_ratio:.2f}, 唯一率 {plan.left_quality.unique_ratio:.2f}\n"
-        f"- 右键质量: 非空率 {plan.right_quality.non_null_ratio:.2f}, 唯一率 {plan.right_quality.unique_ratio:.2f}\n"
-        f"- 精确交集率: {plan.overlap_ratio:.2f}\n"
-        f"- 规划理由: {plan.reason or '无'}\n"
-        f"- 风险提示:\n{notes}\n\n"
-        "若同意请回复：`确认合并`。\n"
-        "若不同意请回复：`取消合并`（系统将不执行 merge）。"
-    )
-
-
 def _normalize_deterministic_key(series: pd.Series) -> pd.Series:
     return series.fillna("").astype(str).str.strip()
 
@@ -409,7 +381,12 @@ def run_l1_hygiene_skill(
             semantic_contract=semantic_contract,
         )
         if not business_tables:
-            return SkillResult(handled=False, audit=audit, error="No business tables for L1 hygiene skill.")
+            return SkillResult(
+                handled=False,
+                audit=audit,
+                error="No business tables for L1 hygiene skill.",
+                error_type=ERROR_TYPE_TABLE_SELECTION,
+            )
 
         response_lines = [
             "### 💡 分析结论",
@@ -422,37 +399,38 @@ def run_l1_hygiene_skill(
             response_lines.append("⚠️ 语义提示:\n" + "\n".join(f"- {note}" for note in semantic_notes[:5]))
         return SkillResult(handled=True, response_text="\n\n".join(response_lines), result_df=None, audit=audit)
     except Exception as exc:
-        return SkillResult(handled=True, audit=audit, error=f"{type(exc).__name__}: {exc}")
+        return SkillResult(
+            handled=True,
+            audit=audit,
+            error=f"{type(exc).__name__}: {exc}",
+            error_type=ERROR_TYPE_RUNTIME,
+        )
 
 
-def run_l1_l2_hygiene_merge_skill(
+def run_l2_merge_skill(
     dfs_context: Dict[str, pd.DataFrame],
     user_instruction: str = "",
     semantic_contract: Optional[Dict[str, SemanticInferenceResult]] = None,
 ) -> SkillResult:
+    """
+    L2 merge-only worker.
+    Assumes input tables are already cleaned by upstream step (e.g. L1 worker).
+    """
     audit = AuditLogger()
     try:
         contract = semantic_contract or ensure_semantic_contract(
             dfs_context,
             user_instruction=user_instruction,
         )
-        business_tables, semantic_notes, policy = _run_l1_hygiene(
-            dfs_context,
-            audit,
-            user_instruction=user_instruction,
-            semantic_contract=contract,
-        )
-        if not business_tables:
-            return SkillResult(handled=False, audit=audit, error="No business tables for L1/L2 skill.")
-
         sales_name, master_name = _pick_sales_master_tables(dfs_context, semantic_contract=contract)
         if not sales_name or not master_name:
-            block_msg = (
-                "L2已阻断：未能确定可关联的两张业务表。"
-                "请明确指定销售侧明细表与主数据表，并确保存在可用于关联的实体列。"
+            return SkillResult(
+                handled=True,
+                audit=audit,
+                error="L2 merge failed: unable to identify two mergeable business tables.",
+                blocked=True,
+                error_type=ERROR_TYPE_TABLE_SELECTION,
             )
-            audit.info("L2阻断", block_msg, affected_rows=0)
-            return SkillResult(handled=True, response_text=block_msg, audit=audit)
 
         sales_df = dfs_context[sales_name].copy()
         master_df = dfs_context[master_name].copy()
@@ -473,86 +451,28 @@ def run_l1_l2_hygiene_merge_skill(
             )
             contract[master_name] = master_sem
 
-        if _is_merge_rejected(user_instruction):
-            dfs_context.pop(MERGE_PLAN_KEY, None)
-            audit.info("L2取消", "用户取消合并，未执行 merge。", affected_rows=0)
+        plan = propose_merge_plan(
+            left_name=sales_name,
+            right_name=master_name,
+            left_df=sales_df,
+            right_df=master_df,
+            left_semantic=sales_sem,
+            right_semantic=master_sem,
+            user_instruction=user_instruction,
+        )
+        if not plan.valid:
+            details = "; ".join(plan.validation_notes) or "merge key validation failed"
             return SkillResult(
                 handled=True,
-                response_text="已取消本次合并。若要继续，请重新发起合并指令。",
                 audit=audit,
+                error=f"L2 merge failed: {details}",
+                blocked=True,
+                error_type=ERROR_TYPE_MERGE_KEY_INVALID,
             )
 
-        pending_payload = dfs_context.get(MERGE_PLAN_KEY)
-        pending_plan: Optional[MergePlan] = None
-        if (
-            isinstance(pending_payload, dict)
-            and pending_payload.get("sales_name") == sales_name
-            and pending_payload.get("master_name") == master_name
-            and isinstance(pending_payload.get("plan"), dict)
-        ):
-            pending_plan = MergePlan.from_dict(pending_payload["plan"])
-
-        if pending_plan is None:
-            plan = propose_merge_plan(
-                left_name=sales_name,
-                right_name=master_name,
-                left_df=sales_df,
-                right_df=master_df,
-                left_semantic=sales_sem,
-                right_semantic=master_sem,
-                user_instruction=user_instruction,
-            )
-            if not plan.valid:
-                audit.info("L2阻断", "主键规划失败，未执行 merge。", affected_rows=0)
-                details = "\n".join(f"- {item}" for item in plan.validation_notes) or "- 未通过主键质量校验"
-                return SkillResult(
-                    handled=True,
-                    response_text=(
-                        "L2已阻断：未找到可靠的合并主键，系统已停止 merge。\n\n"
-                        f"{details}\n\n"
-                        "请明确提供主键列，或修复关键列质量后再尝试。"
-                    ),
-                    audit=audit,
-                )
-            dfs_context[MERGE_PLAN_KEY] = {
-                "sales_name": sales_name,
-                "master_name": master_name,
-                "plan": plan.to_dict(),
-            }
-            audit.info(
-                "L2预执行",
-                f"已生成 merge 主键计划: {plan.left_key} ↔ {plan.right_key} ({plan.key_type})，等待用户确认。",
-                affected_rows=0,
-            )
-            response_lines = [
-                "### 💡 分析结论",
-                "",
-                "已执行语义增强的 L1 数据体检流程，并输出审计日志。",
-                f"当前清洗策略：`{policy.mode}`。",
-                _format_merge_plan(plan, sales_name=sales_name, master_name=master_name),
-            ]
-            if semantic_notes:
-                response_lines.append("⚠️ 语义提示:\n" + "\n".join(f"- {note}" for note in semantic_notes[:5]))
-            return SkillResult(handled=True, response_text="\n\n".join(response_lines), audit=audit)
-
-        if not _is_merge_confirmed(user_instruction):
-            return SkillResult(
-                handled=True,
-                response_text=(
-                    _format_merge_plan(
-                        pending_plan,
-                        sales_name=sales_name,
-                        master_name=master_name,
-                    )
-                ),
-                audit=audit,
-            )
-
-        sales_key = pending_plan.left_key
-        master_key = pending_plan.right_key
-        key_type = pending_plan.key_type
-        dfs_context.pop(MERGE_PLAN_KEY, None)
-
+        sales_key = plan.left_key
+        master_key = plan.right_key
+        key_type = plan.key_type
         if key_type == "entity_name":
             merged_df = smart_merge(
                 sales_df,
@@ -582,24 +502,21 @@ def run_l1_l2_hygiene_merge_skill(
         dfs_context["销售客户对齐结果.xlsx"] = merged_df
         match_count = int(merged_df[master_key].notna().sum()) if master_key in merged_df.columns else 0
         audit.info("L2匹配结果", f"销售客户匹配 {match_count}/{len(merged_df)}", affected_rows=match_count)
-
-        response_lines = [
-            "### 💡 分析结论",
-            "",
-            "已执行语义增强的 L1 数据体检流程，并输出审计日志。",
-            f"当前清洗策略：`{policy.mode}`。",
-        ]
-        response_lines.append(
-            f"已执行 L2 客户主数据对齐（主键: `{sales_key}` ↔ `{master_key}`，类型: `{key_type}`），生成 `销售客户对齐结果.xlsx`。"
+        response_text = (
+            "### 💡 分析结论\n\n"
+            f"已执行 L2 主数据合并（主键: `{sales_key}` ↔ `{master_key}`，类型: `{key_type}`），"
+            "生成 `销售客户对齐结果.xlsx`。"
         )
-        if semantic_notes:
-            response_lines.append("⚠️ 语义提示:\n" + "\n".join(f"- {note}" for note in semantic_notes[:5]))
-
         return SkillResult(
             handled=True,
-            response_text="\n\n".join(response_lines),
+            response_text=response_text,
             result_df=merged_df,
             audit=audit,
         )
     except Exception as exc:
-        return SkillResult(handled=True, audit=audit, error=f"{type(exc).__name__}: {exc}")
+        return SkillResult(
+            handled=True,
+            audit=audit,
+            error=f"{type(exc).__name__}: {exc}",
+            error_type=ERROR_TYPE_RUNTIME,
+        )

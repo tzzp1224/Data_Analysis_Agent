@@ -98,7 +98,7 @@
 
 - 已新增轻量确定性 skill 路由：
   - `L1` 数据体检
-  - `L1+L2` 清洗 + 主数据对齐
+  - `L2` merge-only worker（通常组合为 `L1 -> L2`）
   - `L3` 财务对账
   - `L4` 趋势可视化
 - 新增 `app/skills/engine.py` 作为统一分发边界，保持 API 编排层与 skill 实现层解耦。
@@ -118,10 +118,40 @@
 - 缺关键列阻断（L2/L3/L4）：
   - 在实体对齐、财务对账、趋势可视化执行前统一检查关键列。
   - 若缺列则直接阻断并返回“当前列 + 语义判定证据 + 修复建议”，避免错误执行。
-- L2 合并安全闸门：
-  - 对 merge 任务，系统先给出主键规划（LLM + 主键质量校验），并等待用户明确确认后才执行。
+- L2 合并安全策略：
+  - 对 merge 任务，系统先给出主键规划（LLM + 主键质量校验）。
   - 若未找到可靠主键，会直接阻断并返回可操作提示，不再强行合并。
   - 若键类型为 `entity_name`（公司名/客户名别称），使用 LLM 辅助对齐；否则走确定性 merge。
+- 新增 Supervisor 多步编排（P1.3）：
+  - 新增 `app/orchestration/`：由 LLM Supervisor 先生成多步计划（如 `L1 -> L2`），再按步骤分发到 worker skill。
+  - 新增 `l2_merge` merge-only worker，用于与 `l1_hygiene` 组合执行，避免把“清洗+合并”硬耦合在一个 step。
+  - 任一步骤出现错误或阻断，会自动回退到 workflow agent 链路，保证任务不中断。
+- 新增结构化错误契约（P1.4）：
+  - `SkillResult` 统一增加 `blocked` 和 `error_type` 字段（如 `missing_required_columns`、`merge_key_invalid`、`runtime_error`）。
+  - Supervisor 只基于结构化信号决定 fallback，不再依赖文案关键词匹配。
+  - 目标：提高多步链路可预测性，降低提示词/文案变动带来的行为漂移。
+
+## 当前完整执行链路（2026-03）
+
+1. **上传阶段（`POST /upload`）**
+   - 先做文件名/后缀/大小校验，再通过 `load_file`（`propose_ingestion_config` + `apply_ingestion`）加载。
+   - 刷新会话上下文与备份，并重新编译 workflow 图。
+
+2. **请求阶段（`POST /chat`）**
+   - 先为当前上下文构建语义契约。
+   - 进入 `run_supervisor_orchestration`，生成多步计划并顺序执行 skill。
+
+3. **Skill 优先执行**
+   - 合并类任务常见路径：`l1_hygiene -> l2_merge`。
+   - 对账类任务：`l3_reconcile`。
+   - 可视化类任务：`l4_visual`。
+
+4. **回退链路**
+   - 若 Supervisor 无可执行计划，或任一步失败/阻断，自动回退到 `app/services/workflow.py`（LLM 代码生成 + trusted_exec + 自愈重试）。
+
+5. **交付阶段**
+   - 统一由 `save_full_context_excel` 导出。
+   - 下载采用 `session_id + token` 绑定校验。
 
 ## 安装与部署
 
@@ -214,12 +244,18 @@ python golden_dataset/run_evaluation.py --api-url http://localhost:8000
 - 预检提示 `LLM key is not ready`：
   在启动 `uvicorn` 的同一个 shell 环境中设置并生效 `GOOGLE_API_KEY`。
 
-## 待优化方向 (Roadmap)
+## Roadmap（唯一事实来源）
 
-- **P1（下一阶段）:** 将核心流程从“自由代码生成”升级为“结构化工具编排（Tool Calling）”。
-- **P1（下一阶段）:** 补齐确定性对账模板（多对一聚合、容差策略、差异归因分层）。
-- **P2:** 增加生产级持久化（Redis + SQL/对象存储）与鉴权授权能力。
-- **P2:** 建立评测与可观测体系（成功率、延迟、重试/错误画像）。
+- **当前阶段：P1.4（已完成）**
+  - 已落地 Supervisor 多步编排 + 结构化错误契约（`plan -> worker steps -> fallback` 闭环）。
+- **最高优先级：P1.5（下一步）**
+  - 将 step 级输入/输出继续标准化（显式 I/O 契约），并增加按 `error_type` 的 step 级重试策略。
+  - 继续保持边界：skill 负责确定性执行，agent 仅作 fallback。
+- **P1.6**
+  - 补齐确定性对账模板（多对一聚合、容差策略、差异归因分层）并纳入 supervisor step。
+- **P2**
+  - 增加生产级持久化（Redis + SQL/对象存储）与鉴权授权能力。
+  - 建立评测与可观测体系（成功率、延迟、错误类型画像）。
 
 ## 开源协议
 

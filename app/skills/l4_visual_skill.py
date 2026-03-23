@@ -13,7 +13,12 @@ from app.skills.column_guard import (
     build_missing_columns_message,
     resolve_required_columns,
 )
-from app.skills.contracts import SkillResult
+from app.skills.contracts import (
+    ERROR_TYPE_MISSING_REQUIRED_COLUMNS,
+    ERROR_TYPE_RUNTIME,
+    ERROR_TYPE_TABLE_SELECTION,
+    SkillResult,
+)
 from app.utils.tools import AuditLogger
 
 
@@ -98,6 +103,8 @@ def run_l4_visual_skill(
                 handled=True,
                 response_text="L4已阻断：当前没有可用于趋势分析的业务表。",
                 audit=audit,
+                blocked=True,
+                error_type=ERROR_TYPE_TABLE_SELECTION,
             )
 
         required_specs = [
@@ -127,7 +134,13 @@ def run_l4_visual_skill(
                 guidance="请补充日期列和金额列后再生成趋势图。",
             )
             audit.info("L4阻断", block_msg.splitlines()[0], affected_rows=0)
-            return SkillResult(handled=True, response_text=block_msg, audit=audit)
+            return SkillResult(
+                handled=True,
+                response_text=block_msg,
+                audit=audit,
+                blocked=True,
+                error_type=ERROR_TYPE_MISSING_REQUIRED_COLUMNS,
+            )
 
         date_col = resolved["date_col"]
         amount_col = resolved["amount_col"]
@@ -142,6 +155,8 @@ def run_l4_visual_skill(
                 handled=True,
                 response_text="L4已阻断：日期或金额列无法解析为有效数据，无法生成趋势图。",
                 audit=audit,
+                blocked=True,
+                error_type=ERROR_TYPE_MISSING_REQUIRED_COLUMNS,
             )
 
         work_df["__month__"] = work_df[date_col].dt.to_period("M").dt.to_timestamp()
@@ -182,6 +197,8 @@ def run_l4_visual_skill(
                 handled=True,
                 response_text="L4已阻断：可用于聚合的趋势数据为空，请检查日期/金额/维度列质量。",
                 audit=audit,
+                blocked=True,
+                error_type=ERROR_TYPE_MISSING_REQUIRED_COLUMNS,
             )
 
         summary_df = grouped.sort_values("__month__").copy()
@@ -191,6 +208,8 @@ def run_l4_visual_skill(
                 handled=True,
                 response_text="L4已阻断：月度聚合后无有效结果，无法产出趋势结论。",
                 audit=audit,
+                blocked=True,
+                error_type=ERROR_TYPE_MISSING_REQUIRED_COLUMNS,
             )
         peak_row = monthly_total.sort_values("value", ascending=False).iloc[0]
         low_row = monthly_total.sort_values("value", ascending=True).iloc[0]
@@ -219,4 +238,9 @@ def run_l4_visual_skill(
             audit=audit,
         )
     except Exception as exc:
-        return SkillResult(handled=True, audit=audit, error=f"{type(exc).__name__}: {exc}")
+        return SkillResult(
+            handled=True,
+            audit=audit,
+            error=f"{type(exc).__name__}: {exc}",
+            error_type=ERROR_TYPE_RUNTIME,
+        )

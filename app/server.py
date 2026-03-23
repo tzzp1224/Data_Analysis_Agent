@@ -16,9 +16,8 @@ from app.services.ingestion import load_file
 from app.services.exporter import save_full_context_excel
 from app.services.semantic_contract import ensure_semantic_contract, invalidate_semantic_contract
 from app.services.workflow import create_workflow
+from app.orchestration import run_supervisor_orchestration
 from app.core.config import settings
-from app.skills.router import route_skill
-from app.skills.engine import execute_skill
 
 app = FastAPI(title="Agentic Data Analyst API")
 
@@ -187,7 +186,6 @@ async def upload_files(session_id: str = Form(...), files: List[UploadFile] = Fi
     
     session = sessions[session_id]
     session.touch()
-    session.dfs_context.pop("__pending_merge_plan__", None)
     loaded_info = []
 
     for file in files:
@@ -257,27 +255,25 @@ async def chat(request: ChatRequest):
             del session.dfs_context[key]
 
     ensure_semantic_contract(session.dfs_context, user_instruction=request.message)
-    skill_name = route_skill(request.message, session.dfs_context)
-    if skill_name:
-        skill_result = execute_skill(skill_name, session.dfs_context, request.message)
-        if skill_result and skill_result.handled:
-            response_text = (
-                f"❌ Runtime Error: {skill_result.error}"
-                if skill_result.error
-                else skill_result.response_text
-            )
-            download_link, audit_summary = build_export_response(
-                session,
-                session_id=session_id,
-                result_df=skill_result.result_df,
-                audit_logger=skill_result.audit,
-            )
-            return ChatResponse(
-                response_text=response_text,
-                chart_jsons=skill_result.chart_jsons,
-                download_url=download_link,
-                audit_summary=audit_summary,
-            )
+    orchestration_result = run_supervisor_orchestration(
+        session.dfs_context,
+        request.message,
+    )
+    if orchestration_result.handled:
+        download_link, audit_summary = build_export_response(
+            session,
+            session_id=session_id,
+            result_df=orchestration_result.result_df,
+            audit_logger=orchestration_result.audit,
+        )
+        return ChatResponse(
+            response_text=orchestration_result.response_text,
+            chart_jsons=orchestration_result.chart_jsons,
+            download_url=download_link,
+            audit_summary=audit_summary,
+        )
+    if orchestration_result.fallback_to_workflow:
+        print(f"⚠️ [Supervisor-Fallback] {orchestration_result.fallback_reason}")
 
     # 初始化返回变量
     chart_jsons = []

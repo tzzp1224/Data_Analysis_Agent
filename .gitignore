@@ -13,3 +13,19 @@ AGENT_E2E_EVALUATION_AUDIT_REPORT_2026-03-13.md
 # Runtime / evaluation artifacts
 golden_dataset/runs/
 *.log
+golden_dataset/scorecard_latest.csv
+
+# Python test / coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# IDE/editor artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Notebook artifacts
+.ipynb_checkpoints/

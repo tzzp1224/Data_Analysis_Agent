@@ -2,7 +2,6 @@ fastapi
 uvicorn
 pandas
 openpyxl            # 处理 Excel
-python-docx         # 处理 Word
 python-dotenv       # 读取 .env
 langchain
 langchain-google-genai  # ✅ 核心变动：适配 Google Gemini
@@ -10,7 +9,6 @@ langchain-core
 pydantic
 langgraph
 plotly
-rapidfuzz 
-openpyxl
-sentence-transformers 
+rapidfuzz
+sentence-transformers
 torch

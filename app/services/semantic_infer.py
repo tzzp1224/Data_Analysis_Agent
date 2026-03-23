@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 import json
-import os
 import re
 
 import pandas as pd
@@ -19,7 +18,6 @@ ALLOWED_COLUMN_LABELS = set(COLUMN_TYPE_SPECS.keys())
 ALLOWED_ROW_LABELS = set(ROW_TYPE_SPECS.keys())
 DEFAULT_COLUMN_LABEL = "unknown"
 DEFAULT_ROW_LABEL = "unknown"
-LLM_TIMEOUT_HINT = os.getenv("SEMANTIC_LLM_TIMEOUT_HINT_SECONDS", "8")
 
 
 @dataclass
@@ -245,7 +243,6 @@ rows={row_specs}
                 ensure_ascii=False,
             ),
             "profile": json.dumps(profile_payload, ensure_ascii=False),
-            "timeout_hint": LLM_TIMEOUT_HINT,
         }
     )
     return _extract_json(raw)

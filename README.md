@@ -99,7 +99,7 @@ This repository now includes a focused P0 pass for reliability and engineering h
 
 - Added lightweight deterministic skill routes for:
   - `L1` hygiene
-  - `L1+L2` hygiene + master-data alignment
+  - `L2` merge-only worker (typically composed as `L1 -> L2`)
   - `L3` reconciliation
   - `L4` trend visualization
 - Introduced `app/skills/engine.py` as the single dispatch boundary to keep API orchestration and skill logic decoupled.
@@ -119,10 +119,40 @@ This repository now includes a focused P0 pass for reliability and engineering h
 - Required-column guardrails:
   - Before `L2`/`L3`/`L4`, system checks critical semantic columns and blocks execution when missing.
   - Blocked responses include current columns + semantic evidence to guide user correction.
-- L2 merge safety gate:
-  - For merge tasks, system now proposes join keys first (LLM + key quality checks) and waits for explicit user confirmation.
+- L2 merge safety policy:
+  - For merge tasks, system proposes join keys first (LLM + key quality checks).
   - If no reliable key is found, merge is blocked with actionable guidance instead of forced execution.
   - If key type is `entity_name`, alias alignment uses LLM-assisted matching; otherwise deterministic merge is used.
+- Added Supervisor multi-step orchestration (P1.3):
+  - Introduced `app/orchestration/`: an LLM Supervisor builds a step plan (for example `L1 -> L2`) and dispatches worker skills in order.
+  - Added `l2_merge` merge-only worker so hygiene and merge can be composed as separate steps.
+  - If any step fails or is blocked, request execution automatically falls back to workflow agent path.
+- Added structured worker error contract (P1.4):
+  - `SkillResult` now includes `blocked` and `error_type` (for example `missing_required_columns`, `merge_key_invalid`, `runtime_error`).
+  - Supervisor fallback decisions are now based on structured fields instead of response-text keyword matching.
+  - Goal: keep multi-step routing stable even when prompt/response wording changes.
+
+## Current Execution Chain (2026-03)
+
+1. **Upload stage (`POST /upload`)**
+   - Files are validated/sanitized, then loaded through `load_file` (`propose_ingestion_config` + `apply_ingestion`).
+   - Session context/backups are refreshed and workflow graph is (re)compiled.
+
+2. **Request stage (`POST /chat`)**
+   - Server prebuilds semantic contract for current context.
+   - `run_supervisor_orchestration` builds a multi-step plan and runs matched skills in sequence.
+
+3. **Skill-first execution**
+   - Typical merge path: `l1_hygiene -> l2_merge`.
+   - Reconcile path: `l3_reconcile`.
+   - Visualization path: `l4_visual`.
+
+4. **Fallback path**
+   - If supervisor has no valid plan, or any step fails/blocks, flow falls back to `app/services/workflow.py` (LLM code generation + trusted execution + self-healing retries).
+
+5. **Delivery stage**
+   - Export is unified via `save_full_context_excel`.
+   - Download is bound by `session_id + token`.
 
 ## Installation
 
@@ -215,12 +245,18 @@ If `GOOGLE_API_KEY` is missing in the backend environment, evaluation exits earl
 - Preflight reports `LLM key is not ready`:
   Set `GOOGLE_API_KEY` in the same shell/session where `uvicorn` is started.
 
-## Roadmap
+## Roadmap (Single Source of Truth)
 
-- **P1 (Next):** Shift core workflow from free-form code generation to structured tool-calling orchestration.
-- **P1 (Next):** Add deterministic reconciliation templates (many-to-one, tolerance policy, exception triage).
-- **P2:** Add production-grade persistence (Redis + SQL/Object Storage) and authn/authz controls.
-- **P2:** Build evaluation harness and observability dashboard (success rate, latency, retry/error profile).
+- **Current stage: P1.4 (Completed)**
+  - Supervisor multi-step orchestration + structured worker error contract are in place (`plan -> worker steps -> fallback` loop).
+- **Top priority: P1.5 (Next)**
+  - Standardize step-level input/output contract further and add `error_type`-aware step retry policy.
+  - Keep architecture boundary strict: deterministic skills for execution, workflow agent only as fallback.
+- **P1.6**
+  - Add deterministic reconciliation templates (many-to-one aggregation, tolerance policy, layered diff attribution) as supervisor steps.
+- **P2**
+  - Add production-grade persistence (Redis + SQL/Object Storage) and authn/authz controls.
+  - Build evaluation and observability layer (success rate, latency, error-type profile).
 
 ## License
 

@@ -73,7 +73,11 @@ def _date_parse_ratio(series: pd.Series) -> float:
     raw = _safe_to_str_series(series)
     if len(raw) == 0:
         return 0.0
-    parsed = pd.to_datetime(raw, errors="coerce")
+    # Prefer mixed-format parsing when available to avoid noisy format-inference warnings.
+    try:
+        parsed = pd.to_datetime(raw, errors="coerce", format="mixed")
+    except TypeError:
+        parsed = pd.to_datetime(raw, errors="coerce")
     return float(parsed.notna().mean())
 
 
@@ -167,4 +171,3 @@ def build_dataframe_profile(df: pd.DataFrame, table_name: str, row_profile_limit
         "columns": columns,
         "rows": rows,
     }
-
