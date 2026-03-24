@@ -6,8 +6,8 @@ import time
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from typing import List, Optional
+from pydantic import BaseModel, Field
+from typing import Any, List, Optional
 
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -15,8 +15,12 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.services.ingestion import load_file
 from app.services.exporter import save_full_context_excel
 from app.services.semantic_contract import ensure_semantic_contract, invalidate_semantic_contract
-from app.services.workflow import create_workflow
-from app.orchestration import run_supervisor_orchestration
+from app.orchestration import (
+    create_agent_first_workflow,
+    run_agent_first_workflow,
+    merge_audit_envelope,
+    get_official_supervisor_backend,
+)
 from app.core.config import settings
 
 app = FastAPI(title="Agentic Data Analyst API")
@@ -39,7 +43,8 @@ class SessionData:
     def __init__(self):
         self.dfs_context = {}  # 存放 DataFrames
         self.backups = {}  # 独立备份区，避免污染业务表上下文
-        self.workflow_app = None # 编译好的 Graph
+        self.agent_graph_app = None
+        self.pending_hitl: dict[str, Any] | None = None
         self.download_tokens: dict[str, str] = {}
         self.uploaded_files: set[str] = set()
         self.generated_files: set[str] = set()
@@ -56,32 +61,20 @@ sessions: dict[str, SessionData] = {}
 class ChatRequest(BaseModel):
     session_id: str
     message: str
+    human_action: Optional[str] = None
 
 class ChatResponse(BaseModel):
     response_text: str
-    chart_jsons: List[str] = []
+    status: str = "done"
+    chart_jsons: List[str] = Field(default_factory=list)
     download_url: Optional[str] = None
     audit_summary: Optional[str] = None
+    route_trace: List[dict] = Field(default_factory=list)
+    next_action: Optional[str] = None
 
 
 def get_exportable_context(dfs_context: dict) -> dict:
     return {name: df for name, df in dfs_context.items() if not name.startswith("__")}
-
-
-def extract_runtime_error_summary(raw_msg: str) -> str:
-    if "❌ Runtime Error" not in raw_msg:
-        return ""
-    lines = [line.strip() for line in str(raw_msg).splitlines() if line.strip()]
-    # Prefer the last meaningful exception line over traceback header.
-    for line in reversed(lines):
-        if line.startswith("❌ Runtime Error"):
-            continue
-        if line.startswith("Traceback"):
-            continue
-        if line.startswith("File "):
-            continue
-        return line[:300]
-    return "Unknown runtime error"
 
 
 def sanitize_filename(filename: str) -> str:
@@ -213,19 +206,37 @@ async def upload_files(session_id: str = Form(...), files: List[UploadFile] = Fi
             raise HTTPException(status_code=400, detail=f"Failed to load {safe_filename}: {str(e)}")
 
     invalidate_semantic_contract(session.dfs_context)
-    session.workflow_app = create_workflow(session.dfs_context, session.backups)
+    try:
+        session.agent_graph_app = create_agent_first_workflow(session.dfs_context, session.backups)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    session.pending_hitl = None
     return {"message": "Upload success", "details": loaded_info}
 
 
 @app.get("/health")
 async def health():
     cleanup_expired_sessions()
+    backend = get_official_supervisor_backend()
     return {
         "status": "ok",
         "llm_ready": bool(settings.GOOGLE_API_KEY),
         "model": settings.GOOGLE_MODEL_NAME,
         "active_sessions": len(sessions),
+        "agent_first_enabled": bool(settings.AGENT_FIRST_ENABLED),
+        "supervisor_backend": backend or "unavailable",
+        "official_supervisor_ready": bool(backend),
     }
+
+def reset_temporary_state(session: SessionData) -> None:
+    if "__last_result_df__" in session.dfs_context:
+        del session.dfs_context["__last_result_df__"]
+    if "__last_audit__" in session.dfs_context:
+        del session.dfs_context["__last_audit__"]
+    for key in list(session.dfs_context.keys()):
+        if str(key).startswith("__backup_"):
+            del session.dfs_context[key]
+
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
@@ -233,145 +244,56 @@ async def chat(request: ChatRequest):
     session_id = request.session_id
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session expired")
-    
+
     session = sessions[session_id]
     session.touch()
-    if not session.workflow_app:
-        session.workflow_app = create_workflow({}, {})
+    reset_temporary_state(session)
+    if not settings.AGENT_FIRST_ENABLED:
+        raise HTTPException(status_code=503, detail="Agent-first path is disabled by configuration.")
 
-    state = {
-        "messages": [], 
-        "user_instruction": request.message,
-        "error_count": 0,
-        "chart_jsons": [],
-        "reply": ""
-    }
-    
-    # 清理旧状态 (保留 context 中的数据表，清除上一次的临时结果)
-    if '__last_result_df__' in session.dfs_context: del session.dfs_context['__last_result_df__']
-    if '__last_audit__' in session.dfs_context: del session.dfs_context['__last_audit__']
-    for key in list(session.dfs_context.keys()):
-        if str(key).startswith("__backup_"):
-            del session.dfs_context[key]
+    if not session.agent_graph_app:
+        try:
+            session.agent_graph_app = create_agent_first_workflow(session.dfs_context, session.backups)
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e))
 
     ensure_semantic_contract(session.dfs_context, user_instruction=request.message)
-    orchestration_result = run_supervisor_orchestration(
-        session.dfs_context,
-        request.message,
+    final_state = run_agent_first_workflow(
+        session.agent_graph_app,
+        user_instruction=request.message,
+        human_action=request.human_action or "",
+        pending_hitl=session.pending_hitl,
     )
-    if orchestration_result.handled:
-        download_link, audit_summary = build_export_response(
-            session,
-            session_id=session_id,
-            result_df=orchestration_result.result_df,
-            audit_logger=orchestration_result.audit,
-        )
-        return ChatResponse(
-            response_text=orchestration_result.response_text,
-            chart_jsons=orchestration_result.chart_jsons,
-            download_url=download_link,
-            audit_summary=audit_summary,
-        )
-    if orchestration_result.fallback_to_workflow:
-        print(f"⚠️ [Supervisor-Fallback] {orchestration_result.fallback_reason}")
+    status = str(final_state.get("status", "done"))
+    route_trace = list(final_state.get("route_trace", []))
+    audit_envelope = list(final_state.get("audit_envelope", []))
+    next_action = str(final_state.get("next_action", "")).strip() or None
 
-    # 初始化返回变量
-    chart_jsons = []
+    session.pending_hitl = final_state.get("pending_hitl") if status == "awaiting_human" else None
+    merged_audit = merge_audit_envelope(session.dfs_context.get("__last_audit__"), audit_envelope)
+    if merged_audit is not None:
+        session.dfs_context["__last_audit__"] = merged_audit
+
+    response_text = str(final_state.get("reply", "")).strip()
+    if not response_text:
+        response_text = "执行完成。" if status == "done" else "任务处理中。"
+
+    chart_jsons = list(final_state.get("chart_jsons", []))
     download_link = None
     audit_summary = None
-    steps_log = []
-    final_answer = ""
-    error_msg = None
-    last_runtime_error_summary = ""
-    saw_executor_success = False
-
-    try:
-        # 运行 Workflow
-        for event in session.workflow_app.stream(state, config={"recursion_limit": 30}):
-            for key, val in event.items():
-                if key == "executor":
-                    if "messages" in val:
-                        raw_msg = val["messages"][-1].content
-                        
-                        # 1. 提取 PLAN (思考过程)
-                        if "# PLAN:" in raw_msg:
-                            try:
-                                plan_part = raw_msg.split("# PLAN:")[1].split("# CODE")[0].strip()
-                                # 移除 # 号，防止字体过大
-                                plan_clean = "\n".join([line.strip("# ").strip() for line in plan_part.splitlines()])
-                                steps_log.append(f"🧠 **思考**: {plan_clean}")
-                            except:
-                                pass
-                        
-                        # 2. 提取 Insights (分析结论)
-                        # 识别包含结论的文本，并清洗
-                        if "📊 分析结论" in raw_msg or "✅" in raw_msg or "清洗完成" in raw_msg:
-                            clean = raw_msg.replace("(Signal: WORKER_DONE)", "").strip()
-                            if clean not in final_answer:
-                                final_answer += clean + "\n\n"
-                        if "✅ 成功" in raw_msg:
-                            saw_executor_success = True
-
-                        # 3. 拦截报错
-                        if "❌ Runtime Error" in raw_msg:
-                            steps_log.append("🔧 **自愈**: 检测到代码错误，正在自动修正...")
-                            summary = extract_runtime_error_summary(raw_msg)
-                            if summary:
-                                last_runtime_error_summary = summary
-
-                    if "chart_jsons" in val:
-                        chart_jsons.extend(val["chart_jsons"])
-                
-                elif key == "general_chat":
-                    if "messages" in val:
-                        final_answer += val["messages"][0].content
-
-        result_df = session.dfs_context.pop('__last_result_df__', None)
-        audit_logger = session.dfs_context.pop('__last_audit__', None)
+    if status == "done":
+        result_df = session.dfs_context.pop("__last_result_df__", None)
+        audit_logger = session.dfs_context.pop("__last_audit__", None)
         download_link, audit_summary = build_export_response(session, session_id, result_df, audit_logger)
 
-    except Exception as e:
-        error_msg = f"系统异常: {str(e)}"
-        print(f"Server Error: {str(e)}")
-
-    # ==========================================
-    # 🎨 响应文本格式化 (解决字体过大问题)
-    # ==========================================
-    formatted_response = ""
-    
-    if steps_log:
-        formatted_response += "### 🧩 执行过程\n\n"
-        for step in steps_log:
-            # 再次确保清洗掉 Markdown 标题符
-            clean_step = step.replace("#", "").strip()
-            formatted_response += f"- {clean_step}\n\n"
-        formatted_response += "---\n\n"
-
-    if final_answer:
-        formatted_response += "### 💡 分析结论\n\n"
-        # 降级标题，防止字体爆炸
-        lines = final_answer.split('\n')
-        clean_lines = []
-        for line in lines:
-            if line.strip().startswith("#"):
-                clean_lines.append(f"**{line.strip('# ')}**")
-            else:
-                clean_lines.append(line)
-        formatted_response += "\n\n".join(clean_lines)
-    
-    if error_msg:
-        formatted_response += f"\n\n🚨 **错误提示**: {error_msg}"
-        if not final_answer: formatted_response = error_msg
-    elif last_runtime_error_summary and not saw_executor_success:
-        formatted_response += f"\n\n❌ Runtime Error: {last_runtime_error_summary}"
-        if not final_answer and not steps_log:
-            formatted_response = f"❌ Runtime Error: {last_runtime_error_summary}"
-
     return ChatResponse(
-        response_text=formatted_response,
+        response_text=response_text,
+        status=status,
         chart_jsons=chart_jsons,
         download_url=download_link,
-        audit_summary=audit_summary
+        audit_summary=audit_summary,
+        route_trace=route_trace,
+        next_action=next_action,
     )
 
 @app.get("/download/{filename}")

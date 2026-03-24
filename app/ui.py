@@ -139,6 +139,17 @@ def render_message(msg):
 # ==========================================
 def send_to_agent(prompt_text, is_system_trigger=False):
     """发送请求到后端，处理响应，更新状态，并强制刷新"""
+    command = str(prompt_text or "").strip()
+    lowered = command.lower()
+    human_action = None
+    message_text = prompt_text
+    if lowered in {"/approve", "approve", "同意"}:
+        human_action = "approve"
+    elif lowered in {"/reject", "reject", "拒绝"}:
+        human_action = "reject"
+    elif lowered.startswith("/revise "):
+        human_action = "revise"
+        message_text = command.split(" ", 1)[1].strip() or prompt_text
     
     # 如果是用户手动输入，先展示用户消息（占位，防止刷新前看不见）
     if not is_system_trigger:
@@ -152,8 +163,10 @@ def send_to_agent(prompt_text, is_system_trigger=False):
             try:
                 payload = {
                     "session_id": st.session_state.session_id,
-                    "message": prompt_text
+                    "message": message_text
                 }
+                if human_action:
+                    payload["human_action"] = human_action
                 res = requests.post(f"{API_URL}/chat", json=payload)
                 
                 if res.status_code == 200:
@@ -166,6 +179,10 @@ def send_to_agent(prompt_text, is_system_trigger=False):
                         "charts": data.get("chart_jsons", []),
                         "download": data.get("download_url")
                     }
+                    if data.get("status") and data.get("status") != "done":
+                        action_tip = data.get("next_action") or ""
+                        if action_tip:
+                            new_msg["content"] = f"{new_msg['content']}\n\n---\n\n{action_tip}"
                     
                     # 存入历史
                     st.session_state.messages.append(new_msg)

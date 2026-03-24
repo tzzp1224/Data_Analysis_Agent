@@ -103,7 +103,7 @@ This repository now includes a focused P0 pass for reliability and engineering h
   - `L3` reconciliation
   - `L4` trend visualization
 - Introduced `app/skills/engine.py` as the single dispatch boundary to keep API orchestration and skill logic decoupled.
-- Skill-first path runs before free-form Python generation; non-matching tasks still fall back to workflow.
+- Agent-first path now runs by default; deterministic skills are used as repair/fallback nodes.
 - Added semantic layer for tabular robustness:
   - `app/services/semantic_taxonomy.py`: extensible column/row type taxonomy.
   - `app/services/semantic_profile.py`: column name + value-distribution profiling.
@@ -123,36 +123,42 @@ This repository now includes a focused P0 pass for reliability and engineering h
   - For merge tasks, system proposes join keys first (LLM + key quality checks).
   - If no reliable key is found, merge is blocked with actionable guidance instead of forced execution.
   - If key type is `entity_name`, alias alignment uses LLM-assisted matching; otherwise deterministic merge is used.
-- Added Supervisor multi-step orchestration (P1.3):
-  - Introduced `app/orchestration/`: an LLM Supervisor builds a step plan (for example `L1 -> L2`) and dispatches worker skills in order.
-  - Added `l2_merge` merge-only worker so hygiene and merge can be composed as separate steps.
-  - If any step fails or is blocked, request execution automatically falls back to workflow agent path.
-- Added structured worker error contract (P1.4):
-  - `SkillResult` now includes `blocked` and `error_type` (for example `missing_required_columns`, `merge_key_invalid`, `runtime_error`).
-  - Supervisor fallback decisions are now based on structured fields instead of response-text keyword matching.
-  - Goal: keep multi-step routing stable even when prompt/response wording changes.
+- Added Agent-First Supervisor graph:
+  - `POST /chat` defaults to one LangGraph state machine: `supervisor -> agent_worker -> validator -> skill_repair/human_gate -> finalize`.
+  - `supervisor` node now uses official LangGraph supervisor-worker routing backend (`create_supervisor`) to produce the worker handoff decision.
+  - Supervisor emits structured routing fields (`primary`, `fallback_chain`, `risk_level`, `reason`).
+  - `blocked` no longer auto-falls back to free-form execution; it enters `human_gate`.
+  - `ChatRequest` supports optional `human_action=approve|reject|revise`.
+  - `ChatResponse` now includes `status`, `route_trace`, and `next_action`.
+  - Mainline `/chat` is now single-path (agent-first only); legacy dual-path auto-fallback has been removed.
+  - Official supervisor API availability is enforced via `SUPERVISOR_REQUIRE_OFFICIAL` and exposed in `/health`.
 
-## Current Execution Chain (2026-03)
+## Current Execution Chain (Agent-First, 2026-03)
 
 1. **Upload stage (`POST /upload`)**
    - Files are validated/sanitized, then loaded through `load_file` (`propose_ingestion_config` + `apply_ingestion`).
-   - Session context/backups are refreshed and workflow graph is (re)compiled.
+   - Session context/backups are refreshed and the agent-first graph is (re)compiled.
 
 2. **Request stage (`POST /chat`)**
    - Server prebuilds semantic contract for current context.
-   - `run_supervisor_orchestration` builds a multi-step plan and runs matched skills in sequence.
+   - Runs one LangGraph supervisor workflow with agent-first routing.
+   - The route decision is produced by official supervisor-worker backend, then enforced by finance policy gates (agent-first default + low-risk whitelist for direct skill).
 
-3. **Skill-first execution**
-   - Typical merge path: `l1_hygiene -> l2_merge`.
-   - Reconcile path: `l3_reconcile`.
-   - Visualization path: `l4_visual`.
+3. **Agent-first execution**
+   - Agent path executes first for dirty real-world tasks (header drift, alias mismatch, mixed formatting).
+   - Validator enforces strict checks before delivery, especially for high-risk finance instructions.
 
-4. **Fallback path**
-   - If supervisor has no valid plan, or any step fails/blocks, flow falls back to `app/services/workflow.py` (LLM code generation + trusted execution + self-healing retries).
+4. **Repair + HITL path**
+   - Validation/runtime issues route to deterministic `skill_repair`.
+   - If `skill_repair` blocks/fails, flow enters `human_gate` (`status=awaiting_human`) and waits for `human_action`.
 
 5. **Delivery stage**
-   - Export is unified via `save_full_context_excel`.
-   - Download is bound by `session_id + token`.
+   - Only `status=done` requests produce downloadable outputs.
+   - Export remains unified via `save_full_context_excel`, with `session_id + token` download binding.
+
+6. **HITL continuation**
+   - When `status=awaiting_human`, client can continue the same route with `human_action=approve|reject|revise`.
+   - Streamlit client supports shortcut commands: `/approve`, `/reject`, `/revise <new instruction>`.
 
 ## Installation
 
@@ -186,7 +192,63 @@ This repository now includes a focused P0 pass for reliability and engineering h
 
    ```
    GOOGLE_API_KEY=your_api_key_here
+   # Optional runtime flags
+   AGENT_FIRST_ENABLED=true
+   SUPERVISOR_MAX_AGENT_RETRIES=2
+   # Comma-separated whitelist for low-risk direct-skill execution
+   SUPERVISOR_DIRECT_SKILL_WHITELIST=
+   # If true (default), startup fails when official supervisor API is unavailable
+   SUPERVISOR_REQUIRE_OFFICIAL=true
    ```
+
+## Official Supervisor Setup (Step-by-Step)
+
+1. Install dependencies:
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. Verify official supervisor import:
+
+   ```bash
+   python - <<'PY'
+backend = None
+try:
+    from langgraph.prebuilt import create_supervisor  # noqa: F401
+    backend = "langgraph.prebuilt.create_supervisor"
+except Exception:
+    pass
+if backend is None:
+    try:
+        from langgraph_supervisor import create_supervisor  # noqa: F401
+        backend = "langgraph_supervisor.create_supervisor"
+    except Exception:
+        pass
+print(backend or "unavailable")
+PY
+   ```
+
+   Expected output:
+   - `langgraph_supervisor.create_supervisor`, or
+   - `langgraph.prebuilt.create_supervisor`
+
+3. Enable hard gate in `.env`:
+
+   ```bash
+   SUPERVISOR_REQUIRE_OFFICIAL=true
+   ```
+
+4. Start backend and check health:
+
+   ```bash
+   uvicorn app.server:app --reload --host 0.0.0.0 --port 8000
+   curl http://localhost:8000/health
+   ```
+
+   Confirm:
+   - `official_supervisor_ready=true`
+   - `supervisor_backend` is not `unavailable`
 
 ## Usage
 
@@ -247,14 +309,17 @@ If `GOOGLE_API_KEY` is missing in the backend environment, evaluation exits earl
 
 ## Roadmap (Single Source of Truth)
 
-- **Current stage: P1.4 (Completed)**
-  - Supervisor multi-step orchestration + structured worker error contract are in place (`plan -> worker steps -> fallback` loop).
-- **Top priority: P1.5 (Next)**
-  - Standardize step-level input/output contract further and add `error_type`-aware step retry policy.
-  - Keep architecture boundary strict: deterministic skills for execution, workflow agent only as fallback.
-- **P1.6**
-  - Add deterministic reconciliation templates (many-to-one aggregation, tolerance policy, layered diff attribution) as supervisor steps.
-- **P2**
+- **Current stage: P2.2 (In Progress)**
+  - Single-path `/chat` orchestration is active (`supervisor -> agent_worker -> validator -> skill_repair/human_gate`), legacy dual-path auto-fallback removed.
+  - Official supervisor API availability is now a startup gate (`SUPERVISOR_REQUIRE_OFFICIAL=true` by default).
+- **Top priority: P2.3 (Next)**
+  - Strengthen validator contracts for reconciliation quality thresholds and confidence-gated delivery.
+  - Finalize step-level input/output contracts and `error_type`-aware retry policy (carry-over from previous P1.5 plan).
+  - Extend route-level HITL controls (approval policies by risk level and task type).
+- **P2.4**
+  - Add deterministic reconciliation templates (many-to-one aggregation, tolerance policy, layered diff attribution) and integrate them into repair nodes (carry-over from previous P1.6 plan).
+  - Build deterministic repair templates for more dirty-data reconciliation variants.
+- **P3**
   - Add production-grade persistence (Redis + SQL/Object Storage) and authn/authz controls.
   - Build evaluation and observability layer (success rate, latency, error-type profile).
 

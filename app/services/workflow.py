@@ -470,6 +470,10 @@ def executor_node(state: AgentState, dfs_context: dict, backups_context: Optiona
     print(f"\n⚡ 执行代码:\n{clean_code_string(code)[:80]}...")
     
     result = execute_code(dfs_context, code, backups_context=backups_context)
+    if isinstance(result.get("dfs"), dict):
+        # 保证沙箱执行后的上下文变更可跨轮次复用。
+        dfs_context.clear()
+        dfs_context.update(result["dfs"])
     
     updates = {}
     if result['success']:

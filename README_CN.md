@@ -102,7 +102,7 @@
   - `L3` 财务对账
   - `L4` 趋势可视化
 - 新增 `app/skills/engine.py` 作为统一分发边界，保持 API 编排层与 skill 实现层解耦。
-- 命中 skill 时优先走确定性执行；未命中时回退到现有 workflow。
+- 默认改为 `agent first`；确定性 skill 作为修复/兜底节点执行。
 - 新增语义层，提升 CSV/Excel 泛化能力：
   - `app/services/semantic_taxonomy.py`：可扩展列类型/行类型定义。
   - `app/services/semantic_profile.py`：列名 + 值分布画像。
@@ -122,36 +122,42 @@
   - 对 merge 任务，系统先给出主键规划（LLM + 主键质量校验）。
   - 若未找到可靠主键，会直接阻断并返回可操作提示，不再强行合并。
   - 若键类型为 `entity_name`（公司名/客户名别称），使用 LLM 辅助对齐；否则走确定性 merge。
-- 新增 Supervisor 多步编排（P1.3）：
-  - 新增 `app/orchestration/`：由 LLM Supervisor 先生成多步计划（如 `L1 -> L2`），再按步骤分发到 worker skill。
-  - 新增 `l2_merge` merge-only worker，用于与 `l1_hygiene` 组合执行，避免把“清洗+合并”硬耦合在一个 step。
-  - 任一步骤出现错误或阻断，会自动回退到 workflow agent 链路，保证任务不中断。
-- 新增结构化错误契约（P1.4）：
-  - `SkillResult` 统一增加 `blocked` 和 `error_type` 字段（如 `missing_required_columns`、`merge_key_invalid`、`runtime_error`）。
-  - Supervisor 只基于结构化信号决定 fallback，不再依赖文案关键词匹配。
-  - 目标：提高多步链路可预测性，降低提示词/文案变动带来的行为漂移。
+- 新增 Agent-First Supervisor 图：
+  - `POST /chat` 默认进入单一 LangGraph 状态机：`supervisor -> agent_worker -> validator -> skill_repair/human_gate -> finalize`。
+  - `supervisor` 节点现已接入官方 LangGraph supervisor-worker 路由后端（`create_supervisor`）产出 worker handoff 决策。
+  - Supervisor 输出结构化路由字段：`primary`、`fallback_chain`、`risk_level`、`reason`。
+  - `blocked` 不再自动回退到自由代码执行，改为进入 `human_gate`。
+  - `ChatRequest` 支持可选 `human_action=approve|reject|revise`。
+  - `ChatResponse` 新增 `status`、`route_trace`、`next_action`。
+  - `/chat` 主链路已收敛为单路径（仅 agent-first），移除 legacy 双轨自动回退。
+  - 通过 `SUPERVISOR_REQUIRE_OFFICIAL` 强制官方 supervisor API 可用，并在 `/health` 暴露状态。
 
-## 当前完整执行链路（2026-03）
+## 当前完整执行链路（Agent-First，2026-03）
 
 1. **上传阶段（`POST /upload`）**
    - 先做文件名/后缀/大小校验，再通过 `load_file`（`propose_ingestion_config` + `apply_ingestion`）加载。
-   - 刷新会话上下文与备份，并重新编译 workflow 图。
+   - 刷新会话上下文与备份，并重新编译 agent-first 图。
 
 2. **请求阶段（`POST /chat`）**
    - 先为当前上下文构建语义契约。
-   - 进入 `run_supervisor_orchestration`，生成多步计划并顺序执行 skill。
+   - 进入单一 LangGraph Supervisor 工作流，默认 `agent first`。
+   - 路由决策由官方 supervisor-worker 后端给出，再由财务策略门控执行（agent-first 默认 + 低风险白名单才可直达 skill）。
 
-3. **Skill 优先执行**
-   - 合并类任务常见路径：`l1_hygiene -> l2_merge`。
-   - 对账类任务：`l3_reconcile`。
-   - 可视化类任务：`l4_visual`。
+3. **Agent 优先执行**
+   - 先由 agent 处理真实脏数据任务（脏表头、别名实体、混合格式）。
+   - `validator` 对高风险财务任务做交付前校验。
 
-4. **回退链路**
-   - 若 Supervisor 无可执行计划，或任一步失败/阻断，自动回退到 `app/services/workflow.py`（LLM 代码生成 + trusted_exec + 自愈重试）。
+4. **修复与 HITL 链路**
+   - 校验失败或运行失败时进入确定性 `skill_repair`。
+   - `skill_repair` 阻断/失败时进入 `human_gate`，返回 `status=awaiting_human`，等待 `human_action` 续跑。
 
 5. **交付阶段**
-   - 统一由 `save_full_context_excel` 导出。
-   - 下载采用 `session_id + token` 绑定校验。
+   - 仅 `status=done` 的请求才交付可下载文件。
+   - 导出仍由 `save_full_context_excel` 统一处理，下载继续采用 `session_id + token` 校验。
+
+6. **HITL 续跑**
+   - 当返回 `status=awaiting_human` 时，可在下一次请求携带 `human_action=approve|reject|revise` 续跑同一路径。
+   - Streamlit 端支持快捷命令：`/approve`、`/reject`、`/revise <新指令>`。
 
 ## 安装与部署
 
@@ -185,7 +191,63 @@
 
    ```
    GOOGLE_API_KEY=your_api_key_here
+   # 可选运行开关
+   AGENT_FIRST_ENABLED=true
+   SUPERVISOR_MAX_AGENT_RETRIES=2
+   # 低风险可直达 skill 的白名单（逗号分隔）
+   SUPERVISOR_DIRECT_SKILL_WHITELIST=
+   # 为 true（默认）时，若运行环境不支持官方 supervisor API 将启动失败
+   SUPERVISOR_REQUIRE_OFFICIAL=true
    ```
+
+## 官方 Supervisor 配置步骤
+
+1. 安装依赖：
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. 校验官方 supervisor 导入是否可用：
+
+   ```bash
+   python - <<'PY'
+backend = None
+try:
+    from langgraph.prebuilt import create_supervisor  # noqa: F401
+    backend = "langgraph.prebuilt.create_supervisor"
+except Exception:
+    pass
+if backend is None:
+    try:
+        from langgraph_supervisor import create_supervisor  # noqa: F401
+        backend = "langgraph_supervisor.create_supervisor"
+    except Exception:
+        pass
+print(backend or "unavailable")
+PY
+   ```
+
+   期望输出之一：
+   - `langgraph_supervisor.create_supervisor`
+   - `langgraph.prebuilt.create_supervisor`
+
+3. 在 `.env` 中启用硬门禁：
+
+   ```bash
+   SUPERVISOR_REQUIRE_OFFICIAL=true
+   ```
+
+4. 启动后端并检查健康状态：
+
+   ```bash
+   uvicorn app.server:app --reload --host 0.0.0.0 --port 8000
+   curl http://localhost:8000/health
+   ```
+
+   确认：
+   - `official_supervisor_ready=true`
+   - `supervisor_backend` 不为 `unavailable`
 
 ## 启动服务
 
@@ -246,14 +308,17 @@ python golden_dataset/run_evaluation.py --api-url http://localhost:8000
 
 ## Roadmap（唯一事实来源）
 
-- **当前阶段：P1.4（已完成）**
-  - 已落地 Supervisor 多步编排 + 结构化错误契约（`plan -> worker steps -> fallback` 闭环）。
-- **最高优先级：P1.5（下一步）**
-  - 将 step 级输入/输出继续标准化（显式 I/O 契约），并增加按 `error_type` 的 step 级重试策略。
-  - 继续保持边界：skill 负责确定性执行，agent 仅作 fallback。
-- **P1.6**
-  - 补齐确定性对账模板（多对一聚合、容差策略、差异归因分层）并纳入 supervisor step。
-- **P2**
+- **当前阶段：P2.2（进行中）**
+  - `/chat` 已收敛为单路径编排（`supervisor -> agent_worker -> validator -> skill_repair/human_gate`），移除 legacy 双轨自动回退。
+  - 官方 supervisor API 可用性已纳入启动门禁（`SUPERVISOR_REQUIRE_OFFICIAL=true` 默认开启）。
+- **最高优先级：P2.3（下一步）**
+  - 加强对账类 validator 合约（质量阈值、置信度门控、交付前校验）。
+  - 完成 step 级输入/输出契约与按 `error_type` 的重试策略（承接旧版 P1.5 路线）。
+  - 按风险等级完善 HITL 审批策略与续跑规则。
+- **P2.4**
+  - 将确定性对账模板（多对一聚合、容差策略、差异归因分层）纳入 repair 节点（承接旧版 P1.6 路线）。
+  - 扩展更多脏数据对账修复模板（确定性 repair 模板库）。
+- **P3**
   - 增加生产级持久化（Redis + SQL/对象存储）与鉴权授权能力。
   - 建立评测与可观测体系（成功率、延迟、错误类型画像）。
 

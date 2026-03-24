@@ -58,6 +58,7 @@ def run_supervisor_orchestration(
                 handled=False,
                 fallback_to_workflow=True,
                 fallback_reason=f"Step {idx} `{step.worker}` not handled.",
+                audit=merged_audit,
             )
 
         _merge_audit(merged_audit, step_result.audit)
@@ -67,6 +68,7 @@ def run_supervisor_orchestration(
                 handled=False,
                 fallback_to_workflow=True,
                 fallback_reason=f"Step {idx} `{step.worker}` failed ({error_type}): {step_result.error}",
+                audit=merged_audit,
             )
         if step_result.blocked:
             block_type = step_result.error_type or "blocked"
@@ -74,6 +76,7 @@ def run_supervisor_orchestration(
                 handled=False,
                 fallback_to_workflow=True,
                 fallback_reason=f"Step {idx} `{step.worker}` blocked ({block_type}).",
+                audit=merged_audit,
             )
 
         if step_result.response_text.strip():
