@@ -122,17 +122,20 @@
   - 对 merge 任务，系统先给出主键规划（LLM + 主键质量校验）。
   - 若未找到可靠主键，会直接阻断并返回可操作提示，不再强行合并。
   - 若键类型为 `entity_name`（公司名/客户名别称），使用 LLM 辅助对齐；否则走确定性 merge。
-- 新增 Agent-First Supervisor 图：
-  - `POST /chat` 默认进入单一 LangGraph 状态机：`supervisor -> agent_worker -> validator -> skill_repair/human_gate -> finalize`。
-  - `supervisor` 节点现已接入官方 LangGraph supervisor-worker 路由后端（`create_supervisor`）产出 worker handoff 决策。
-  - Supervisor 输出结构化路由字段：`primary`、`fallback_chain`、`risk_level`、`reason`。
-  - `blocked` 不再自动回退到自由代码执行，改为进入 `human_gate`。
-  - `ChatRequest` 支持可选 `human_action=approve|reject|revise`。
-  - `ChatResponse` 新增 `status`、`route_trace`、`next_action`。
-  - `/chat` 主链路已收敛为单路径（仅 agent-first），移除 legacy 双轨自动回退。
+- 新增 Supervisor v2 多步图：
+  - `POST /chat` 进入单一 LangGraph 状态机：
+    `supervisor_plan -> supervisor_dispatch -> worker_execute -> supervisor_review -> finalize`。
+  - supervisor 先全局拆解任务，再按步骤顺序路由 worker。
+  - 每个 worker 执行结束后必须回到 supervisor，再决定下一步。
+  - `ChatRequest` 支持可选：
+    `human_action=approve|reject|revise`、`resume_plan_id=<plan_id>`。
+  - `ChatResponse` 升级为执行导向结构：
+    顶层 `status/message/next_action`，
+    `execution={plan_id,current_step_idx,plan_steps,step_results,route_trace}`，
+    `artifacts={download_url,chart_jsons,audit_summary}`。
   - 通过 `SUPERVISOR_REQUIRE_OFFICIAL` 强制官方 supervisor API 可用，并在 `/health` 暴露状态。
 
-## 当前完整执行链路（Agent-First，2026-03）
+## 当前完整执行链路（Supervisor v2，2026-03）
 
 1. **上传阶段（`POST /upload`）**
    - 先做文件名/后缀/大小校验，再通过 `load_file`（`propose_ingestion_config` + `apply_ingestion`）加载。
@@ -140,23 +143,21 @@
 
 2. **请求阶段（`POST /chat`）**
    - 先为当前上下文构建语义契约。
-   - 进入单一 LangGraph Supervisor 工作流，默认 `agent first`。
-   - 路由决策由官方 supervisor-worker 后端给出，再由财务策略门控执行（agent-first 默认 + 低风险白名单才可直达 skill）。
+   - supervisor 先生成全局计划（`plan_steps`），再逐步执行。
+   - 每一步执行后进入 `supervisor_review`，通过后再路由下一步。
+   - 运行时已收敛为单一 Supervisor v2 主链路，旧 `orchestrator/build_task_plan` 适配层已移除。
 
-3. **Agent 优先执行**
-   - 先由 agent 处理真实脏数据任务（脏表头、别名实体、混合格式）。
-   - `validator` 对高风险财务任务做交付前校验。
+3. **失败策略与 HITL**
+   - `runtime_error`：自动重试（每步最多 2 次）。
+   - `missing_required_columns` / `merge_key_invalid` / `table_selection_failed`：不重试，直接进入 HITL。
+   - `approve` 从阻断步骤续跑；`revise` 按新指令重规划；`reject` 终止计划。
 
-4. **修复与 HITL 链路**
-   - 校验失败或运行失败时进入确定性 `skill_repair`。
-   - `skill_repair` 阻断/失败时进入 `human_gate`，返回 `status=awaiting_human`，等待 `human_action` 续跑。
-
-5. **交付阶段**
+4. **交付阶段**
    - 仅 `status=done` 的请求才交付可下载文件。
    - 导出仍由 `save_full_context_excel` 统一处理，下载继续采用 `session_id + token` 校验。
 
-6. **HITL 续跑**
-   - 当返回 `status=awaiting_human` 时，可在下一次请求携带 `human_action=approve|reject|revise` 续跑同一路径。
+5. **HITL 续跑**
+   - 当返回 `status=awaiting_human` 时，可在下一次请求携带 `human_action=approve|reject|revise`，并可选传 `resume_plan_id` 续跑。
    - Streamlit 端支持快捷命令：`/approve`、`/reject`、`/revise <新指令>`。
 
 ## 安装与部署
@@ -193,9 +194,6 @@
    GOOGLE_API_KEY=your_api_key_here
    # 可选运行开关
    AGENT_FIRST_ENABLED=true
-   SUPERVISOR_MAX_AGENT_RETRIES=2
-   # 低风险可直达 skill 的白名单（逗号分隔）
-   SUPERVISOR_DIRECT_SKILL_WHITELIST=
    # 为 true（默认）时，若运行环境不支持官方 supervisor API 将启动失败
    SUPERVISOR_REQUIRE_OFFICIAL=true
    ```
@@ -308,16 +306,15 @@ python golden_dataset/run_evaluation.py --api-url http://localhost:8000
 
 ## Roadmap（唯一事实来源）
 
-- **当前阶段：P2.2（进行中）**
-  - `/chat` 已收敛为单路径编排（`supervisor -> agent_worker -> validator -> skill_repair/human_gate`），移除 legacy 双轨自动回退。
-  - 官方 supervisor API 可用性已纳入启动门禁（`SUPERVISOR_REQUIRE_OFFICIAL=true` 默认开启）。
-- **最高优先级：P2.3（下一步）**
-  - 加强对账类 validator 合约（质量阈值、置信度门控、交付前校验）。
-  - 完成 step 级输入/输出契约与按 `error_type` 的重试策略（承接旧版 P1.5 路线）。
-  - 按风险等级完善 HITL 审批策略与续跑规则。
-- **P2.4**
-  - 将确定性对账模板（多对一聚合、容差策略、差异归因分层）纳入 repair 节点（承接旧版 P1.6 路线）。
-  - 扩展更多脏数据对账修复模板（确定性 repair 模板库）。
+- **当前阶段：P2.5（已完成，作为基线）**
+  - API 与 CLI 已统一到同一套 Supervisor v2 编排链路。
+  - 旧 workflow 图已退场，`app/services/workflow.py` 仅保留最小 legacy shim。
+  - `agent_worker` 内部加入轻量 ReAct 小循环（`max_attempts=2`），并带有每次尝试级可观测性。
+  - 上下文工程统一为 `ContextPacket`（`system_invariants/plan_slice/schema_digest/memory_slice/error_feedback`）。
+  - skills 继续采用声明式 `SKILL.md` 路由，不开放插件执行，不引入 MCP。
+- **最高优先级：P2.6**
+  - 扩展确定性对账修复模板（多对一聚合、容差策略、差异归因分层）。
+  - 增强生产可观测性看板（step 延迟、重试画像、阻断类型画像）。
 - **P3**
   - 增加生产级持久化（Redis + SQL/对象存储）与鉴权授权能力。
   - 建立评测与可观测体系（成功率、延迟、错误类型画像）。

@@ -1,7 +1,7 @@
 {
   "dataset_name": "Agentic Finance Golden Dataset",
-  "version": "v1.0.9",
-  "generated_at_utc": "2026-03-11T09:00:58Z",
+  "version": "v1.1.0",
+  "generated_at_utc": "2026-03-26T12:00:00Z",
   "version_policy": {
     "patch": "v1.0.x: only metadata/evaluation tooling/expectation updates; no case data content changes",
     "minor": "v1.x.0: add/modify benchmark case data or business scenarios"
@@ -56,6 +56,22 @@
       "evaluation_focus": [
         "至少生成1张可视化图表",
         "文字洞察可解释 8 月华南异常与 12 月华东峰值"
+      ]
+    },
+    {
+      "case_id": "MULTI_STEP_SUPERVISOR_CHAIN",
+      "files": [
+        "cases/cleaning_merge/销售台账_脏数据.xlsx",
+        "cases/cleaning_merge/客户主数据_标准库.xlsx",
+        "cases/reconciliation/系统日记账_复杂版.xlsx",
+        "cases/reconciliation/银行流水_复杂版.xlsx",
+        "cases/visualization/区域月度经营数据_2024.xlsx"
+      ],
+      "recommended_prompt": "请先清洗，再合并，再对账，再可视化，最后输出包含审计日志的结果。",
+      "evaluation_focus": [
+        "Supervisor 按顺序执行多步骤计划",
+        "每一步执行后回到 supervisor 再路由下一步",
+        "最终输出可下载结果与审计日志"
       ]
     }
   ]

@@ -2,6 +2,13 @@
 
 All notable changes to the golden dataset are documented in this file.
 
+## [v1.1.0] - 2026-03-26
+- Added multi-step supervisor regression case:
+  - New case `MULTI_STEP_SUPERVISOR_CHAIN` validates sequential routing (`clean -> merge -> reconcile -> visual`).
+  - Added corresponding expectations in `expected_snapshots.json`.
+- Updated dataset version files to `v1.1.0`.
+- Goal: verify supervisor-worker ordered execution and HITL-continuation readiness.
+
 ## [v1.0.9] - 2026-03-13
 - Introduced explicit cleaning-policy layer in semantic L1 pipeline:
   - Default mode is `conservative` to reduce accidental data loss on unknown real-world files.
@@ -76,7 +83,7 @@ All notable changes to the golden dataset are documented in this file.
 ## [v1.0.0] - 2026-03-11
 - Initial golden Excel dataset with 4 benchmark scenarios and manifest.
 
-## Planned [v1.1.0]
+## Planned [v1.2.0]
 - Add new enterprise scenarios (cross-currency reconciliation, tax invoice alignment, payment channel split-merge).
 - Add stricter structured assertions on output workbook content and business KPI checks.
 - Introduce baseline comparison command (`--compare-with <run_id>`) for trend reporting.

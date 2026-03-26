@@ -21,6 +21,7 @@ from app.orchestration import (
     merge_audit_envelope,
     get_official_supervisor_backend,
 )
+from app.orchestration.memory import ExecutionMemory
 from app.core.config import settings
 
 app = FastAPI(title="Agentic Data Analyst API")
@@ -44,7 +45,7 @@ class SessionData:
         self.dfs_context = {}  # 存放 DataFrames
         self.backups = {}  # 独立备份区，避免污染业务表上下文
         self.agent_graph_app = None
-        self.pending_hitl: dict[str, Any] | None = None
+        self.pending_execution_state: ExecutionMemory | None = None
         self.download_tokens: dict[str, str] = {}
         self.uploaded_files: set[str] = set()
         self.generated_files: set[str] = set()
@@ -62,15 +63,30 @@ class ChatRequest(BaseModel):
     session_id: str
     message: str
     human_action: Optional[str] = None
+    resume_plan_id: Optional[str] = None
 
-class ChatResponse(BaseModel):
-    response_text: str
-    status: str = "done"
+
+class ExecutionPayload(BaseModel):
+    plan_id: str = ""
+    current_step_idx: int = 0
+    plan_steps: List[dict] = Field(default_factory=list)
+    step_results: List[dict] = Field(default_factory=list)
+    route_trace: List[dict] = Field(default_factory=list)
+    execution_status: str = "running"
+
+
+class ArtifactPayload(BaseModel):
     chart_jsons: List[str] = Field(default_factory=list)
     download_url: Optional[str] = None
     audit_summary: Optional[str] = None
-    route_trace: List[dict] = Field(default_factory=list)
+
+
+class ChatResponse(BaseModel):
+    status: str = "done"
+    message: str
     next_action: Optional[str] = None
+    execution: ExecutionPayload = Field(default_factory=ExecutionPayload)
+    artifacts: ArtifactPayload = Field(default_factory=ArtifactPayload)
 
 
 def get_exportable_context(dfs_context: dict) -> dict:
@@ -210,7 +226,7 @@ async def upload_files(session_id: str = Form(...), files: List[UploadFile] = Fi
         session.agent_graph_app = create_agent_first_workflow(session.dfs_context, session.backups)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
-    session.pending_hitl = None
+    session.pending_execution_state = None
     return {"message": "Upload success", "details": loaded_info}
 
 
@@ -228,10 +244,10 @@ async def health():
         "official_supervisor_ready": bool(backend),
     }
 
-def reset_temporary_state(session: SessionData) -> None:
+def reset_temporary_state(session: SessionData, *, keep_last_audit: bool = False) -> None:
     if "__last_result_df__" in session.dfs_context:
         del session.dfs_context["__last_result_df__"]
-    if "__last_audit__" in session.dfs_context:
+    if (not keep_last_audit) and "__last_audit__" in session.dfs_context:
         del session.dfs_context["__last_audit__"]
     for key in list(session.dfs_context.keys()):
         if str(key).startswith("__backup_"):
@@ -247,7 +263,9 @@ async def chat(request: ChatRequest):
 
     session = sessions[session_id]
     session.touch()
-    reset_temporary_state(session)
+    action = str(request.human_action or "").strip().lower()
+    keep_last_audit = bool(session.pending_execution_state and action in {"", "approve", "revise"})
+    reset_temporary_state(session, keep_last_audit=keep_last_audit)
     if not settings.AGENT_FIRST_ENABLED:
         raise HTTPException(status_code=503, detail="Agent-first path is disabled by configuration.")
 
@@ -262,21 +280,41 @@ async def chat(request: ChatRequest):
         session.agent_graph_app,
         user_instruction=request.message,
         human_action=request.human_action or "",
-        pending_hitl=session.pending_hitl,
+        pending_state=session.pending_execution_state.to_pending_state()
+        if session.pending_execution_state
+        else None,
+        resume_plan_id=request.resume_plan_id or "",
     )
     status = str(final_state.get("status", "done"))
     route_trace = list(final_state.get("route_trace", []))
     audit_envelope = list(final_state.get("audit_envelope", []))
     next_action = str(final_state.get("next_action", "")).strip() or None
 
-    session.pending_hitl = final_state.get("pending_hitl") if status == "awaiting_human" else None
+    plan_id = str(final_state.get("plan_id", "")).strip()
+    plan_steps = list(final_state.get("plan_steps", []))
+    current_step_idx = int(final_state.get("current_step_idx", 0) or 0)
+    step_results = list(final_state.get("step_results", []))
+    execution_status = str(final_state.get("execution_status", status)).strip() or status
+    pending_hitl = dict(final_state.get("pending_hitl") or {})
+
+    if status == "awaiting_human":
+        session.pending_execution_state = ExecutionMemory(
+            plan_id=plan_id,
+            plan_steps=plan_steps,
+            current_step_idx=current_step_idx,
+            step_results=step_results,
+            pending_hitl=pending_hitl,
+        )
+    else:
+        session.pending_execution_state = None
+
     merged_audit = merge_audit_envelope(session.dfs_context.get("__last_audit__"), audit_envelope)
     if merged_audit is not None:
         session.dfs_context["__last_audit__"] = merged_audit
 
-    response_text = str(final_state.get("reply", "")).strip()
-    if not response_text:
-        response_text = "执行完成。" if status == "done" else "任务处理中。"
+    message = str(final_state.get("reply", "")).strip()
+    if not message:
+        message = "执行完成。" if status == "done" else "任务处理中。"
 
     chart_jsons = list(final_state.get("chart_jsons", []))
     download_link = None
@@ -287,13 +325,22 @@ async def chat(request: ChatRequest):
         download_link, audit_summary = build_export_response(session, session_id, result_df, audit_logger)
 
     return ChatResponse(
-        response_text=response_text,
         status=status,
-        chart_jsons=chart_jsons,
-        download_url=download_link,
-        audit_summary=audit_summary,
-        route_trace=route_trace,
+        message=message,
         next_action=next_action,
+        execution=ExecutionPayload(
+            plan_id=plan_id,
+            current_step_idx=current_step_idx,
+            plan_steps=plan_steps,
+            step_results=step_results,
+            route_trace=route_trace,
+            execution_status=execution_status,
+        ),
+        artifacts=ArtifactPayload(
+            chart_jsons=chart_jsons,
+            download_url=download_link,
+            audit_summary=audit_summary,
+        ),
     )
 
 @app.get("/download/{filename}")

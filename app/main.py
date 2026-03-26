@@ -1,146 +1,186 @@
-import sys
 import os
-import plotly.io as pio
+import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# ✅ 修正导入：使用新的 generator 函数名
-from app.utils.generator import create_complex_test_data
-from app.utils.finance_generator import create_reconciliation_data
-# 引入 Ingestion 组件
-from app.services.ingestion import propose_ingestion_config, apply_ingestion
-from app.services.exporter import save_result_with_audit
-from app.services.workflow import create_workflow
+from app.orchestration import (  # noqa: E402
+    create_agent_first_workflow,
+    merge_audit_envelope,
+    run_agent_first_workflow,
+)
+from app.orchestration.memory import ExecutionMemory  # noqa: E402
+from app.services.exporter import save_result_with_audit  # noqa: E402
+from app.services.ingestion import apply_ingestion, propose_ingestion_config  # noqa: E402
+from app.services.semantic_contract import ensure_semantic_contract  # noqa: E402
+from app.utils.finance_generator import create_reconciliation_data  # noqa: E402
+from app.utils.generator import create_complex_test_data  # noqa: E402
 
-def interactive_file_loader(file_paths: list):
-    """
-    模拟前端的 '交互式文件导入' 过程
-    """
+
+def interactive_file_loader(file_paths: list[str]):
+    """模拟前端的交互式文件导入过程。"""
+
     dfs_context = {}
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print("📂 交互式数据摄取 (Interactive Ingestion)")
-    print("="*50)
-    
+    print("=" * 50)
+
     for fp in file_paths:
         filename = os.path.basename(fp)
         print(f"\n🔍 正在分析文件结构: {filename} ...")
-        
-        # 1. AI 提案
+
         try:
             config = propose_ingestion_config(fp)
-            
-            # 2. 用户确认 (模拟前端弹窗)
             print(f"   🤖 AI 建议: Sheet='{config.sheet_name}', Header在第 {config.header_row} 行")
             print(f"      理由: {config.reason}")
-            
-            # 模拟用户点击确认 (y)
+
             user_input = input(f"   👉 是否采用此配置加载 {filename}? (y/n) [y]: ").strip().lower()
-            if user_input == 'n':
+            if user_input == "n":
                 print("   (跳过加载)")
                 continue
-            
-            # 3. 执行加载
+
             df = apply_ingestion(config)
             dfs_context[filename] = df
             print(f"   ✅ 加载成功! Shape: {df.shape}")
-            
         except Exception as e:
             print(f"   ❌ 加载失败: {e}")
-            
+
     return dfs_context
 
+
+def _parse_cli_action(command: str) -> tuple[str, str]:
+    text = str(command or "").strip()
+    lowered = text.lower()
+    if lowered in {"/approve", "approve", "同意"}:
+        return "approve", text
+    if lowered in {"/reject", "reject", "拒绝"}:
+        return "reject", text
+    if lowered.startswith("/revise "):
+        revised = text.split(" ", 1)[1].strip()
+        return "revise", revised or text
+    return "", text
+
+
+def _reset_temporary_state(dfs_context: dict, *, keep_last_audit: bool = False) -> None:
+    if "__last_result_df__" in dfs_context:
+        del dfs_context["__last_result_df__"]
+    if (not keep_last_audit) and "__last_audit__" in dfs_context:
+        del dfs_context["__last_audit__"]
+    for key in list(dfs_context.keys()):
+        if str(key).startswith("__backup_"):
+            del dfs_context[key]
+
+
 def main():
-    print("="*50)
-    print("🤖 AI Agentic Data Analyst (CLI Mode)")
-    print("="*50)
+    print("=" * 50)
+    print("🤖 AI Agentic Data Analyst (CLI Mode / Supervisor v2)")
+    print("=" * 50)
 
-    # 1. ✅ 调用新的生成器函数
     file_paths_1 = create_complex_test_data()
-    file_paths_2 = create_reconciliation_data()   # ✅ 新增：财务对账数据
-    # 合并文件列表供加载
+    file_paths_2 = create_reconciliation_data()
     all_files = file_paths_1 + file_paths_2
-    
-    # 2. 交互式加载 (传入所有文件)
-    dfs_context = interactive_file_loader(all_files)
 
-    
+    dfs_context = interactive_file_loader(all_files)
     if not dfs_context:
         print("没有数据被加载，程序退出。")
         return
 
-    # 3. 初始化 Workflow
     backups_context = {name: df.copy(deep=True) for name, df in dfs_context.items()}
-    app = create_workflow(dfs_context, backups_context)
-    
-    # 清理可能存在的旧状态
-    if '__last_result_df__' in dfs_context: del dfs_context['__last_result_df__']
-    if '__last_audit__' in dfs_context: del dfs_context['__last_audit__']
+    graph_app = create_agent_first_workflow(dfs_context, backups_context)
+    pending_execution_state: ExecutionMemory | None = None
 
-    print("\n" + "="*50)
-    print("🤖 系统已就绪。支持：清洗 / 模糊匹配 / 审计 / 导出")
-    print("提示：试试输入 '请清洗数据并导出' 或 '合并表格并导出'")
-    print("="*50)
-    
-    # 保存历史 context
-    state = {
-        "messages": [], 
-        "user_instruction": "", 
-        "error_count": 0,
-        "chart_jsons": [],
-        "reply": ""
-    }
+    print("\n" + "=" * 50)
+    print("🤖 系统已就绪（Supervisor v2）。")
+    print("支持：清洗 / 合并 / 对账 / 可视化 / HITL 续跑")
+    print("HITL 指令：/approve, /reject, /revise <新指令>")
+    print("=" * 50)
 
     while True:
         try:
-            instruction = input("\n💬 请输入指令 (exit退出): ").strip()
+            command = input("\n💬 请输入指令 (exit退出): ").strip()
         except EOFError:
             break
-            
-        if instruction.lower() == 'exit':
-            break
-        if not instruction:
-            continue
-        
-        # 更新指令
-        state["user_instruction"] = instruction
-        state["error_count"] = 0 
-        
-        print(f"⚙️ 正在思考...")
-        try:
-            for event in app.stream(state, config={"recursion_limit": 25}):
-                for key, val in event.items():
-                    if key == "executor":
-                        # 打印执行日志
-                        if "messages" in val:
-                            log = val['messages'][-1].content
-                            # 提取关键信息打印
-                            if "✅" in log:
-                                print(f"   ✅ 执行成功")
-                            elif "❌" in log:
-                                print(f"   ❌ 执行报错 (正在自愈...)")
-                            # 如果有 Print 输出的 Insights，也可以在这里看到
-                            
-                        # 处理 Excel 导出
-                        if '__last_result_df__' in dfs_context:
-                            res_df = dfs_context.pop('__last_result_df__')
-                            # 获取 Audit 对象 (如果有)
-                            audit_logger = dfs_context.pop('__last_audit__', None)
-                            
-                            output_path = "data/output_result.xlsx"
-                            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                            
-                            save_result_with_audit(res_df, audit_logger, output_path)
-                            print(f"   💾 [交付] 结果文件已保存至: {output_path}")
-                            if audit_logger:
-                                print(f"      (包含审计日志 Sheet)")
 
-                        # 处理图表
-                        if "chart_jsons" in val and val["chart_jsons"]:
-                            print(f"   🎨 [交付] 生成了 {len(val['chart_jsons'])} 张图表 (data/chart.html)")
-                            pio.from_json(val['chart_jsons'][0]).write_html("data/chart.html")
-                            
+        if command.lower() == "exit":
+            break
+        if not command:
+            continue
+
+        human_action, message_text = _parse_cli_action(command)
+        keep_last_audit = bool(pending_execution_state and human_action in {"", "approve", "revise"})
+        _reset_temporary_state(dfs_context, keep_last_audit=keep_last_audit)
+
+        if not message_text:
+            print("⚠️ revise 需要提供新指令，例如: /revise 先清洗再对账")
+            continue
+
+        ensure_semantic_contract(dfs_context, user_instruction=message_text)
+
+        pending_payload = (
+            pending_execution_state.to_pending_state() if pending_execution_state else None
+        )
+        resume_plan_id = pending_execution_state.plan_id if pending_execution_state else ""
+
+        print("⚙️ Supervisor 正在执行...")
+        try:
+            final_state = run_agent_first_workflow(
+                graph_app,
+                user_instruction=message_text,
+                human_action=human_action,
+                pending_state=pending_payload,
+                resume_plan_id=resume_plan_id,
+            )
         except Exception as e:
             print(f"❌ 系统错误: {e}")
+            continue
+
+        status = str(final_state.get("status", "done"))
+        execution_status = str(final_state.get("execution_status", status))
+        reply = str(final_state.get("reply", "")).strip() or "流程已结束。"
+        print(f"\n[{execution_status}] {reply}")
+
+        plan_id = str(final_state.get("plan_id", "")).strip()
+        plan_steps = list(final_state.get("plan_steps", []))
+        current_step_idx = int(final_state.get("current_step_idx", 0) or 0)
+        step_results = list(final_state.get("step_results", []))
+
+        if status == "awaiting_human":
+            pending_execution_state = ExecutionMemory(
+                plan_id=plan_id,
+                plan_steps=plan_steps,
+                current_step_idx=current_step_idx,
+                step_results=step_results,
+                pending_hitl=dict(final_state.get("pending_hitl") or {}),
+            )
+            next_action = str(final_state.get("next_action", "")).strip()
+            if next_action:
+                print(f"👉 下一步: {next_action}")
+        else:
+            pending_execution_state = None
+
+        merged_audit = merge_audit_envelope(
+            dfs_context.get("__last_audit__"),
+            list(final_state.get("audit_envelope", [])),
+        )
+        if merged_audit is not None:
+            dfs_context["__last_audit__"] = merged_audit
+
+        chart_jsons = list(final_state.get("chart_jsons", []))
+        if chart_jsons:
+            import plotly.io as pio
+
+            os.makedirs("data", exist_ok=True)
+            pio.from_json(chart_jsons[0]).write_html("data/chart.html")
+            print(f"🎨 已生成 {len(chart_jsons)} 张图表，保存至 data/chart.html")
+
+        if status == "done":
+            result_df = dfs_context.pop("__last_result_df__", None)
+            audit_logger = dfs_context.pop("__last_audit__", None)
+            if result_df is not None or audit_logger is not None:
+                output_path = "data/output_result.xlsx"
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                save_result_with_audit(result_df, audit_logger, output_path)
+                print(f"💾 [交付] 结果文件已保存至: {output_path}")
+
 
 if __name__ == "__main__":
     main()

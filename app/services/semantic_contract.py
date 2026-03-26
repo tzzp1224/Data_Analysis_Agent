@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import asdict, dataclass
 from typing import Dict, Tuple
 
 import pandas as pd
@@ -10,6 +11,12 @@ from app.services.semantic_infer import SemanticInferenceResult, infer_dataframe
 
 SEMANTIC_CACHE_KEY = "__semantic_contract__"
 SEMANTIC_META_KEY = "__semantic_contract_meta__"
+
+
+@dataclass(frozen=True)
+class SemanticMemory:
+    instruction: str
+    table_signatures: dict
 
 
 def _business_table_items(dfs_context: Dict[str, pd.DataFrame]) -> list[Tuple[str, pd.DataFrame]]:
@@ -42,11 +49,19 @@ def _context_signature(dfs_context: Dict[str, pd.DataFrame]) -> dict:
     return {name: _table_signature(df) for name, df in _business_table_items(dfs_context)}
 
 
-def _cache_matches(meta: dict, instruction: str, signature: dict) -> bool:
+def _meta_to_dict(meta: object) -> dict:
+    if isinstance(meta, SemanticMemory):
+        return asdict(meta)
+    if isinstance(meta, dict):
+        return dict(meta)
+    return {}
+
+
+def _cache_matches(meta: object, instruction: str, signature: dict) -> bool:
+    meta_dict = _meta_to_dict(meta)
     return (
-        isinstance(meta, dict)
-        and meta.get("instruction") == instruction
-        and meta.get("table_signatures") == signature
+        meta_dict.get("instruction") == instruction
+        and meta_dict.get("table_signatures") == signature
     )
 
 
@@ -89,8 +104,8 @@ def ensure_semantic_contract(
         )
 
     dfs_context[SEMANTIC_CACHE_KEY] = contract
-    dfs_context[SEMANTIC_META_KEY] = {
-        "instruction": instruction,
-        "table_signatures": signature,
-    }
+    dfs_context[SEMANTIC_META_KEY] = SemanticMemory(
+        instruction=instruction,
+        table_signatures=signature,
+    )
     return contract

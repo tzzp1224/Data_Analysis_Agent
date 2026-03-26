@@ -123,17 +123,20 @@ This repository now includes a focused P0 pass for reliability and engineering h
   - For merge tasks, system proposes join keys first (LLM + key quality checks).
   - If no reliable key is found, merge is blocked with actionable guidance instead of forced execution.
   - If key type is `entity_name`, alias alignment uses LLM-assisted matching; otherwise deterministic merge is used.
-- Added Agent-First Supervisor graph:
-  - `POST /chat` defaults to one LangGraph state machine: `supervisor -> agent_worker -> validator -> skill_repair/human_gate -> finalize`.
-  - `supervisor` node now uses official LangGraph supervisor-worker routing backend (`create_supervisor`) to produce the worker handoff decision.
-  - Supervisor emits structured routing fields (`primary`, `fallback_chain`, `risk_level`, `reason`).
-  - `blocked` no longer auto-falls back to free-form execution; it enters `human_gate`.
-  - `ChatRequest` supports optional `human_action=approve|reject|revise`.
-  - `ChatResponse` now includes `status`, `route_trace`, and `next_action`.
-  - Mainline `/chat` is now single-path (agent-first only); legacy dual-path auto-fallback has been removed.
-  - Official supervisor API availability is enforced via `SUPERVISOR_REQUIRE_OFFICIAL` and exposed in `/health`.
+- Added Supervisor v2 multi-step graph:
+  - `POST /chat` now runs a single LangGraph state machine:
+    `supervisor_plan -> supervisor_dispatch -> worker_execute -> supervisor_review -> finalize`.
+  - Supervisor first builds a full step plan, then routes workers step-by-step in order.
+  - Each worker completion returns to supervisor before dispatching the next step.
+  - `ChatRequest` now supports optional:
+    `human_action=approve|reject|revise`, `resume_plan_id=<plan_id>`.
+  - `ChatResponse` is execution-oriented:
+    top-level `status/message/next_action`,
+    `execution={plan_id,current_step_idx,plan_steps,step_results,route_trace}`,
+    `artifacts={download_url,chart_jsons,audit_summary}`.
+  - Official supervisor API availability is still enforced via `SUPERVISOR_REQUIRE_OFFICIAL` and exposed in `/health`.
 
-## Current Execution Chain (Agent-First, 2026-03)
+## Current Execution Chain (Supervisor v2, 2026-03)
 
 1. **Upload stage (`POST /upload`)**
    - Files are validated/sanitized, then loaded through `load_file` (`propose_ingestion_config` + `apply_ingestion`).
@@ -141,23 +144,21 @@ This repository now includes a focused P0 pass for reliability and engineering h
 
 2. **Request stage (`POST /chat`)**
    - Server prebuilds semantic contract for current context.
-   - Runs one LangGraph supervisor workflow with agent-first routing.
-   - The route decision is produced by official supervisor-worker backend, then enforced by finance policy gates (agent-first default + low-risk whitelist for direct skill).
+   - Supervisor generates a global task plan (`plan_steps`) before execution.
+   - Each step is dispatched to one worker and reviewed before moving to the next step.
+   - Runtime now uses a single Supervisor v2 chain; legacy `orchestrator/build_task_plan` adapters were removed.
 
-3. **Agent-first execution**
-   - Agent path executes first for dirty real-world tasks (header drift, alias mismatch, mixed formatting).
-   - Validator enforces strict checks before delivery, especially for high-risk finance instructions.
+3. **Failure policy + HITL**
+   - `runtime_error`: automatic retry (max 2 per step).
+   - `missing_required_columns` / `merge_key_invalid` / `table_selection_failed`: no retry, direct HITL.
+   - `approve` resumes from blocked step; `revise` rebuilds plan with new instruction; `reject` terminates execution.
 
-4. **Repair + HITL path**
-   - Validation/runtime issues route to deterministic `skill_repair`.
-   - If `skill_repair` blocks/fails, flow enters `human_gate` (`status=awaiting_human`) and waits for `human_action`.
-
-5. **Delivery stage**
+4. **Delivery stage**
    - Only `status=done` requests produce downloadable outputs.
    - Export remains unified via `save_full_context_excel`, with `session_id + token` download binding.
 
-6. **HITL continuation**
-   - When `status=awaiting_human`, client can continue the same route with `human_action=approve|reject|revise`.
+5. **HITL continuation**
+   - When `status=awaiting_human`, client can continue with `human_action=approve|reject|revise` and optional `resume_plan_id`.
    - Streamlit client supports shortcut commands: `/approve`, `/reject`, `/revise <new instruction>`.
 
 ## Installation
@@ -194,9 +195,6 @@ This repository now includes a focused P0 pass for reliability and engineering h
    GOOGLE_API_KEY=your_api_key_here
    # Optional runtime flags
    AGENT_FIRST_ENABLED=true
-   SUPERVISOR_MAX_AGENT_RETRIES=2
-   # Comma-separated whitelist for low-risk direct-skill execution
-   SUPERVISOR_DIRECT_SKILL_WHITELIST=
    # If true (default), startup fails when official supervisor API is unavailable
    SUPERVISOR_REQUIRE_OFFICIAL=true
    ```
@@ -309,16 +307,15 @@ If `GOOGLE_API_KEY` is missing in the backend environment, evaluation exits earl
 
 ## Roadmap (Single Source of Truth)
 
-- **Current stage: P2.2 (In Progress)**
-  - Single-path `/chat` orchestration is active (`supervisor -> agent_worker -> validator -> skill_repair/human_gate`), legacy dual-path auto-fallback removed.
-  - Official supervisor API availability is now a startup gate (`SUPERVISOR_REQUIRE_OFFICIAL=true` by default).
-- **Top priority: P2.3 (Next)**
-  - Strengthen validator contracts for reconciliation quality thresholds and confidence-gated delivery.
-  - Finalize step-level input/output contracts and `error_type`-aware retry policy (carry-over from previous P1.5 plan).
-  - Extend route-level HITL controls (approval policies by risk level and task type).
-- **P2.4**
-  - Add deterministic reconciliation templates (many-to-one aggregation, tolerance policy, layered diff attribution) and integrate them into repair nodes (carry-over from previous P1.6 plan).
-  - Build deterministic repair templates for more dirty-data reconciliation variants.
+- **Current stage: P2.5 (Completed / Baseline)**
+  - API and CLI now share the same Supervisor v2 orchestration chain.
+  - Old workflow graph logic is retired into a minimal legacy shim (`app/services/workflow.py`).
+  - `agent_worker` now runs a lightweight ReAct loop (`max_attempts=2`) with context packets and attempt-level observability.
+  - Context engineering is standardized via `ContextPacket` (`system_invariants/plan_slice/schema_digest/memory_slice/error_feedback`).
+  - Skills remain declarative (`SKILL.md`) and deterministic; no external plugin execution or MCP introduced.
+- **Top priority: P2.6**
+  - Expand deterministic reconciliation templates (many-to-one aggregation, tolerance policy, layered diff attribution).
+  - Improve production observability dashboards (step latency, retry profile, blocker taxonomy).
 - **P3**
   - Add production-grade persistence (Redis + SQL/Object Storage) and authn/authz controls.
   - Build evaluation and observability layer (success rate, latency, error-type profile).

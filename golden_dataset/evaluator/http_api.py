@@ -15,6 +15,7 @@ class ApiClientError(RuntimeError):
 
 @dataclass
 class ChatResult:
+    status: str
     response_text: str
     chart_jsons: list[str]
     download_url: str | None
@@ -104,7 +105,19 @@ class AgentApiClient:
         )
         response_bytes = self._open(req)
         data = json.loads(response_bytes.decode("utf-8"))
+
+        if isinstance(data, dict) and "artifacts" in data:
+            artifacts = data.get("artifacts") or {}
+            return ChatResult(
+                status=str(data.get("status", "done")),
+                response_text=data.get("message", ""),
+                chart_jsons=artifacts.get("chart_jsons", []) or [],
+                download_url=artifacts.get("download_url"),
+                audit_summary=artifacts.get("audit_summary"),
+            )
+
         return ChatResult(
+            status=str(data.get("status", "done")),
             response_text=data.get("response_text", ""),
             chart_jsons=data.get("chart_jsons", []) or [],
             download_url=data.get("download_url"),

@@ -12,6 +12,16 @@ from app.skills.l1_hygiene_skill import (
 )
 from app.skills.l3_reconcile_skill import run_l3_reconcile_skill
 from app.skills.l4_visual_skill import run_l4_visual_skill
+from app.skills.l5_anomaly_skill import run_l5_anomaly_skill
+
+
+SUPPORTED_SKILL_WORKERS = (
+    "l1_hygiene",
+    "l2_merge",
+    "l3_reconcile",
+    "l4_visual",
+    "l5_anomaly",
+)
 
 
 def execute_skill(
@@ -40,6 +50,12 @@ def execute_skill(
         )
     if skill_name == "l4_visual":
         return run_l4_visual_skill(
+            dfs_context,
+            instruction=instruction,
+            semantic_contract=semantic_contract,
+        )
+    if skill_name == "l5_anomaly":
+        return run_l5_anomaly_skill(
             dfs_context,
             instruction=instruction,
             semantic_contract=semantic_contract,

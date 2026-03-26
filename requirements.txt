@@ -13,3 +13,4 @@ plotly
 rapidfuzz
 sentence-transformers
 torch
+pytest

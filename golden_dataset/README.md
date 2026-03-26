@@ -5,12 +5,14 @@
 - L2 实体对齐（模糊匹配/语义匹配）
 - L3 财务对账（多对一、容差、单边账）
 - L4 可视化分析与洞察
+- Supervisor 多步骤顺序路由与续跑
 
 ## 目录结构
 - `cases/cleaning_merge/`：清洗 + 主数据对齐
 - `cases/reconciliation/`：复杂对账
 - `cases/ingestion/`：多 Sheet + 非首行表头
 - `cases/visualization/`：趋势分析数据
+- `MULTI_STEP_SUPERVISOR_CHAIN`：多技能顺序编排链路
 
 ## 用法
 1. 启动后端与前端。
@@ -40,7 +42,7 @@ python golden_dataset/run_evaluation.py --api-url http://localhost:8000
 - 变更记录见：`CHANGELOG.md`
 
 ## 版本
-- 当前版本：`v1.0.9`
+- 当前版本：`v1.1.0`
 
 ## 重新生成
 ```bash

@@ -26,6 +26,8 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "files_uploaded" not in st.session_state:
     st.session_state.files_uploaded = False
+if "pending_plan_id" not in st.session_state:
+    st.session_state.pending_plan_id = None
 
 # 注入自定义 CSS (增强版)
 st.markdown("""
@@ -167,22 +169,30 @@ def send_to_agent(prompt_text, is_system_trigger=False):
                 }
                 if human_action:
                     payload["human_action"] = human_action
+                    if st.session_state.pending_plan_id:
+                        payload["resume_plan_id"] = st.session_state.pending_plan_id
                 res = requests.post(f"{API_URL}/chat", json=payload)
                 
                 if res.status_code == 200:
                     data = res.json()
+                    artifacts = data.get("artifacts", {}) or {}
                     
                     # 构造新的消息对象
                     new_msg = {
                         "role": "assistant",
-                        "content": data.get("response_text", ""),
-                        "charts": data.get("chart_jsons", []),
-                        "download": data.get("download_url")
+                        "content": data.get("message", ""),
+                        "charts": artifacts.get("chart_jsons", []),
+                        "download": artifacts.get("download_url")
                     }
                     if data.get("status") and data.get("status") != "done":
                         action_tip = data.get("next_action") or ""
                         if action_tip:
                             new_msg["content"] = f"{new_msg['content']}\n\n---\n\n{action_tip}"
+                    execution = data.get("execution", {}) or {}
+                    if data.get("status") == "awaiting_human":
+                        st.session_state.pending_plan_id = execution.get("plan_id")
+                    else:
+                        st.session_state.pending_plan_id = None
                     
                     # 存入历史
                     st.session_state.messages.append(new_msg)

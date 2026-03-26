@@ -1,5 +1,5 @@
 {
-  "dataset_version": "v1.0.9",
+  "dataset_version": "v1.1.0",
   "default_expectations": {
     "require_download": true,
     "require_audit": false,
@@ -77,6 +77,32 @@
         ],
         "min_data_rows_by_sheet": {
           "区域月度经营数据_2024": 30
+        }
+      }
+    },
+    "MULTI_STEP_SUPERVISOR_CHAIN": {
+      "require_audit": true,
+      "audit_summary": {
+        "min_operations": 2,
+        "min_exclusions": 0
+      },
+      "min_chart_count": 1,
+      "xlsx": {
+        "min_sheet_count": 5,
+        "required_sheet_name_contains": [
+          "销售台账_脏数据",
+          "客户主数据_标准库",
+          "系统日记账_复杂版",
+          "银行流水_复杂版",
+          "区域月度经营数据_2024",
+          "处理日志(Audit)"
+        ],
+        "min_data_rows_by_sheet": {
+          "销售台账_脏数据": 5,
+          "系统日记账_复杂版": 5,
+          "银行流水_复杂版": 4,
+          "区域月度经营数据_2024": 30,
+          "处理日志(Audit)": 1
         }
       }
     }
