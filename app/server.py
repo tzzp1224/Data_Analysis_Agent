@@ -3,9 +3,12 @@ import os
 import uuid
 import re
 import time
+import json
+import asyncio
+from datetime import datetime, timezone
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Any, List, Optional
 
@@ -13,7 +16,9 @@ from typing import Any, List, Optional
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.services.ingestion import load_file
+from app.services.data_readiness import assess_data_readiness
 from app.services.exporter import save_full_context_excel
+from app.services.persistent_memory import JsonMemoryStore
 from app.services.semantic_contract import ensure_semantic_contract, invalidate_semantic_contract
 from app.orchestration import (
     create_agent_first_workflow,
@@ -25,6 +30,7 @@ from app.orchestration.memory import ExecutionMemory
 from app.core.config import settings
 
 app = FastAPI(title="Agentic Data Analyst API")
+MEMORY_STORE = JsonMemoryStore()
 
 # ==========================================
 # 📂 路径配置
@@ -46,6 +52,10 @@ class SessionData:
         self.backups = {}  # 独立备份区，避免污染业务表上下文
         self.agent_graph_app = None
         self.pending_execution_state: ExecutionMemory | None = None
+        self.data_readiness_report: dict[str, Any] = {}
+        self.preferences: dict[str, Any] = {}
+        self.confirmed_mappings: dict[str, Any] = {}
+        self.audit_events: list[dict[str, Any]] = []
         self.download_tokens: dict[str, str] = {}
         self.uploaded_files: set[str] = set()
         self.generated_files: set[str] = set()
@@ -64,6 +74,30 @@ class ChatRequest(BaseModel):
     message: str
     human_action: Optional[str] = None
     resume_plan_id: Optional[str] = None
+    human_payload: Optional[dict[str, Any]] = None
+
+
+class PendingHookPayload(BaseModel):
+    hook_id: str = ""
+    hook_type: str = ""
+    risk_level: str = ""
+    question: str = ""
+    options: List[dict] = Field(default_factory=list)
+    evidence: dict = Field(default_factory=dict)
+    deadline_hint: str = ""
+
+
+class ExecutionEventPayload(BaseModel):
+    event_id: str = ""
+    event_type: str = ""
+    stage: str = ""
+    action: str = ""
+    detail: str = ""
+    timestamp: str = ""
+    plan_id: str = ""
+    step_id: str = ""
+    worker: str = ""
+    meta: dict[str, Any] = Field(default_factory=dict)
 
 
 class ExecutionPayload(BaseModel):
@@ -72,6 +106,9 @@ class ExecutionPayload(BaseModel):
     plan_steps: List[dict] = Field(default_factory=list)
     step_results: List[dict] = Field(default_factory=list)
     route_trace: List[dict] = Field(default_factory=list)
+    events: List[ExecutionEventPayload] = Field(default_factory=list)
+    pending_hook: PendingHookPayload = Field(default_factory=PendingHookPayload)
+    risk_trace: List[dict] = Field(default_factory=list)
     execution_status: str = "running"
 
 
@@ -91,6 +128,143 @@ class ChatResponse(BaseModel):
 
 def get_exportable_context(dfs_context: dict) -> dict:
     return {name: df for name, df in dfs_context.items() if not name.startswith("__")}
+
+
+_TRACE_STEP_RE = re.compile(r"step=([A-Za-z0-9_:\\-]+)")
+_TRACE_WORKER_RE = re.compile(r"worker=([A-Za-z0-9_:\\-]+)")
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _extract_step_worker(trace: dict[str, Any]) -> tuple[str, str]:
+    step_id = str(trace.get("step_id", "")).strip()
+    worker = str(trace.get("worker", "")).strip()
+    detail = str(trace.get("detail", "")).strip()
+    if not step_id:
+        match = _TRACE_STEP_RE.search(detail)
+        if match:
+            step_id = match.group(1)
+    if not worker:
+        match = _TRACE_WORKER_RE.search(detail)
+        if match:
+            worker = match.group(1)
+    return step_id, worker
+
+
+def _map_event_type(stage: str, action: str) -> str:
+    if stage == "supervisor_plan" and action == "planned":
+        return "plan_created"
+    if stage == "supervisor_dispatch" and action == "dispatch":
+        return "route_selected"
+    if stage == "worker_execute":
+        return "worker_finished"
+    if action in {"to_hook", "to_hitl", "await_human"}:
+        return "hook_triggered"
+    if stage == "review_gate":
+        return "review_verdict"
+    if stage == "finalize":
+        return "run_finalized"
+    return "trace_event"
+
+
+def build_execution_events(
+    *,
+    route_trace: list[dict[str, Any]],
+    plan_id: str,
+    status: str,
+    pending_hook: dict[str, Any],
+    download_link: Optional[str],
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+
+    for idx, trace in enumerate(route_trace, start=1):
+        stage = str(trace.get("stage", "")).strip().lower()
+        action = str(trace.get("action", "")).strip().lower()
+        detail = str(trace.get("detail", "")).strip()
+        step_id, worker = _extract_step_worker(trace)
+        reserved = {"timestamp", "stage", "action", "detail", "prompt_version", "step_id", "worker"}
+        meta = {k: v for k, v in trace.items() if k not in reserved}
+        event_type = _map_event_type(stage, action)
+        timestamp = str(trace.get("timestamp", "")).strip() or _utc_now_iso()
+        event_payload = {
+            "event_id": f"evt_{idx:04d}_{uuid.uuid4().hex[:8]}",
+            "event_type": event_type,
+            "stage": stage,
+            "action": action,
+            "detail": detail,
+            "timestamp": timestamp,
+            "plan_id": plan_id,
+            "step_id": step_id,
+            "worker": worker,
+            "meta": meta,
+        }
+        events.append(event_payload)
+
+        if event_type == "route_selected":
+            started = dict(event_payload)
+            started["event_id"] = f"{event_payload['event_id']}_start"
+            started["event_type"] = "worker_started"
+            started["action"] = "worker_started"
+            if not started["detail"]:
+                started["detail"] = "worker started"
+            events.append(started)
+
+    if status == "awaiting_human" and pending_hook:
+        has_hook_event = any(item.get("event_type") == "hook_triggered" for item in events)
+        if not has_hook_event:
+            hook_question = str(pending_hook.get("question", "")).strip() or "需要人工确认"
+            events.append(
+                {
+                    "event_id": f"evt_hook_{uuid.uuid4().hex[:8]}",
+                    "event_type": "hook_triggered",
+                    "stage": "hitl",
+                    "action": "await_human",
+                    "detail": hook_question,
+                    "timestamp": _utc_now_iso(),
+                    "plan_id": plan_id,
+                    "step_id": "",
+                    "worker": "",
+                    "meta": {
+                        "hook_id": str(pending_hook.get("hook_id", "")).strip(),
+                        "hook_type": str(pending_hook.get("hook_type", "")).strip(),
+                        "risk_level": str(pending_hook.get("risk_level", "")).strip(),
+                    },
+                }
+            )
+
+    if download_link:
+        events.append(
+            {
+                "event_id": f"evt_artifact_{uuid.uuid4().hex[:8]}",
+                "event_type": "artifact_emitted",
+                "stage": "delivery",
+                "action": "artifact_emitted",
+                "detail": "download artifact generated",
+                "timestamp": _utc_now_iso(),
+                "plan_id": plan_id,
+                "step_id": "",
+                "worker": "",
+                "meta": {"download_url": download_link},
+            }
+        )
+
+    return events
+
+
+def _model_dump(payload: Any) -> dict[str, Any]:
+    if hasattr(payload, "model_dump"):
+        return dict(payload.model_dump())
+    if hasattr(payload, "dict"):
+        return dict(payload.dict())
+    return dict(payload or {})
+
+
+def _sse_frame(event_name: str, data: dict[str, Any]) -> str:
+    safe_event = str(event_name or "message").strip() or "message"
+    safe_data = json.dumps(data, ensure_ascii=False)
+    return f"event: {safe_event}\ndata: {safe_data}\n\n"
 
 
 def sanitize_filename(filename: str) -> str:
@@ -148,6 +322,35 @@ def cleanup_session_assets(session: SessionData) -> None:
     session.backups.clear()
 
 
+def load_session_memory(session: SessionData, session_id: str) -> None:
+    payload = MEMORY_STORE.load(session_id)
+    session.preferences = dict(payload.get("preferences") or {})
+    session.confirmed_mappings = dict(payload.get("confirmed_mappings") or {})
+    session.audit_events = list(payload.get("audit_events") or [])
+
+
+def persist_session_memory(session: SessionData, session_id: str) -> None:
+    payload = {
+        "preferences": dict(session.preferences),
+        "confirmed_mappings": dict(session.confirmed_mappings),
+        "audit_events": list(session.audit_events)[-500:],
+    }
+    MEMORY_STORE.save(session_id, payload)
+
+
+def append_audit_event(session: SessionData, session_id: str, event_type: str, detail: str, **extra: Any) -> None:
+    event = {
+        "timestamp": _utc_now_iso(),
+        "event_type": event_type,
+        "detail": detail,
+    }
+    if extra:
+        event["meta"] = dict(extra)
+    session.audit_events.append(event)
+    session.audit_events = session.audit_events[-500:]
+    MEMORY_STORE.append_event(session_id, event)
+
+
 def cleanup_expired_sessions() -> None:
     now = time.time()
     expired_ids = [
@@ -192,6 +395,7 @@ async def upload_files(session_id: str = Form(...), files: List[UploadFile] = Fi
     cleanup_expired_sessions()
     if session_id not in sessions:
         sessions[session_id] = SessionData()
+        load_session_memory(sessions[session_id], session_id)
     
     session = sessions[session_id]
     session.touch()
@@ -222,12 +426,24 @@ async def upload_files(session_id: str = Form(...), files: List[UploadFile] = Fi
             raise HTTPException(status_code=400, detail=f"Failed to load {safe_filename}: {str(e)}")
 
     invalidate_semantic_contract(session.dfs_context)
+    readiness = assess_data_readiness(session.dfs_context).to_dict()
+    session.data_readiness_report = readiness
+    session.dfs_context["__data_readiness__"] = readiness
+    session.dfs_context["__data_readiness_ack__"] = False
+    append_audit_event(
+        session,
+        session_id,
+        "data_readiness_assessed",
+        f"status={readiness.get('status')} score={readiness.get('score')}",
+        readiness=readiness,
+    )
     try:
         session.agent_graph_app = create_agent_first_workflow(session.dfs_context, session.backups)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
     session.pending_execution_state = None
-    return {"message": "Upload success", "details": loaded_info}
+    persist_session_memory(session, session_id)
+    return {"message": "Upload success", "details": loaded_info, "data_readiness": readiness}
 
 
 @app.get("/health")
@@ -254,8 +470,7 @@ def reset_temporary_state(session: SessionData, *, keep_last_audit: bool = False
             del session.dfs_context[key]
 
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
+def _execute_chat_request(request: ChatRequest) -> ChatResponse:
     cleanup_expired_sessions()
     session_id = request.session_id
     if session_id not in sessions:
@@ -280,6 +495,7 @@ async def chat(request: ChatRequest):
         session.agent_graph_app,
         user_instruction=request.message,
         human_action=request.human_action or "",
+        human_payload=dict(request.human_payload or {}),
         pending_state=session.pending_execution_state.to_pending_state()
         if session.pending_execution_state
         else None,
@@ -296,6 +512,9 @@ async def chat(request: ChatRequest):
     step_results = list(final_state.get("step_results", []))
     execution_status = str(final_state.get("execution_status", status)).strip() or status
     pending_hitl = dict(final_state.get("pending_hitl") or {})
+    pending_hook = dict(final_state.get("pending_hook") or {})
+    risk_trace = list(final_state.get("risk_trace", []))
+    hook_decisions = dict(final_state.get("hook_decisions") or {})
 
     if status == "awaiting_human":
         session.pending_execution_state = ExecutionMemory(
@@ -304,6 +523,8 @@ async def chat(request: ChatRequest):
             current_step_idx=current_step_idx,
             step_results=step_results,
             pending_hitl=pending_hitl,
+            pending_hook=pending_hook,
+            hook_decisions=hook_decisions,
         )
     else:
         session.pending_execution_state = None
@@ -324,7 +545,47 @@ async def chat(request: ChatRequest):
         audit_logger = session.dfs_context.pop("__last_audit__", None)
         download_link, audit_summary = build_export_response(session, session_id, result_df, audit_logger)
 
-    return ChatResponse(
+    if request.human_payload:
+        decision_type = str((request.human_payload or {}).get("decision_type", "")).strip().lower()
+        decision_value = (request.human_payload or {}).get("decision_value")
+        if decision_type and decision_value is not None:
+            session.confirmed_mappings[decision_type] = decision_value
+            append_audit_event(
+                session,
+                session_id,
+                "human_decision",
+                f"{decision_type}={decision_value}",
+                decision=request.human_payload,
+            )
+
+    event_payloads = build_execution_events(
+        route_trace=route_trace,
+        plan_id=plan_id,
+        status=status,
+        pending_hook=pending_hook,
+        download_link=download_link,
+    )
+    event_models = [ExecutionEventPayload(**item) for item in event_payloads]
+    for event in event_payloads:
+        event_type = str(event.get("event_type", "")).strip().lower()
+        if event_type in {
+            "plan_created",
+            "route_selected",
+            "hook_triggered",
+            "review_verdict",
+            "artifact_emitted",
+        }:
+            append_audit_event(
+                session,
+                session_id,
+                event_type,
+                str(event.get("detail", "")).strip(),
+                event=event,
+            )
+
+    persist_session_memory(session, session_id)
+
+    response_model = ChatResponse(
         status=status,
         message=message,
         next_action=next_action,
@@ -334,6 +595,9 @@ async def chat(request: ChatRequest):
             plan_steps=plan_steps,
             step_results=step_results,
             route_trace=route_trace,
+            events=event_models,
+            pending_hook=PendingHookPayload(**pending_hook) if pending_hook else PendingHookPayload(),
+            risk_trace=risk_trace,
             execution_status=execution_status,
         ),
         artifacts=ArtifactPayload(
@@ -341,6 +605,100 @@ async def chat(request: ChatRequest):
             download_url=download_link,
             audit_summary=audit_summary,
         ),
+    )
+    return response_model
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    return _execute_chat_request(request)
+
+
+@app.post("/chat/stream")
+async def chat_stream(request: ChatRequest):
+    async def event_generator():
+        yield _sse_frame(
+            "connected",
+            {
+                "session_id": request.session_id,
+                "timestamp": _utc_now_iso(),
+            },
+        )
+        yield _sse_frame(
+            "workflow_started",
+            {
+                "session_id": request.session_id,
+                "message": request.message,
+                "timestamp": _utc_now_iso(),
+            },
+        )
+
+        task = asyncio.create_task(asyncio.to_thread(_execute_chat_request, request))
+        heartbeat = 0
+        while not task.done():
+            heartbeat += 1
+            yield _sse_frame(
+                "heartbeat",
+                {
+                    "seq": heartbeat,
+                    "timestamp": _utc_now_iso(),
+                },
+            )
+            await asyncio.sleep(0.35)
+
+        try:
+            response_model = await task
+        except HTTPException as exc:
+            yield _sse_frame(
+                "error",
+                {
+                    "error_type": "http_exception",
+                    "status_code": exc.status_code,
+                    "detail": exc.detail,
+                    "timestamp": _utc_now_iso(),
+                },
+            )
+            return
+        except Exception as exc:
+            yield _sse_frame(
+                "error",
+                {
+                    "error_type": type(exc).__name__,
+                    "detail": str(exc),
+                    "timestamp": _utc_now_iso(),
+                },
+            )
+            return
+
+        response_payload = _model_dump(response_model)
+        execution_payload = dict(response_payload.get("execution") or {})
+        for event in list(execution_payload.get("events") or []):
+            event_type = str(event.get("event_type", "")).strip() or "trace_event"
+            yield _sse_frame(event_type, dict(event))
+
+        yield _sse_frame(
+            "final",
+            {
+                "response": response_payload,
+                "timestamp": _utc_now_iso(),
+            },
+        )
+        yield _sse_frame(
+            "done",
+            {
+                "status": str(response_payload.get("status", "done")),
+                "timestamp": _utc_now_iso(),
+            },
+        )
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 @app.get("/download/{filename}")

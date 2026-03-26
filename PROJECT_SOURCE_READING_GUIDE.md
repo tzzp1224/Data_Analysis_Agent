@@ -10,8 +10,8 @@
 
 这是一个面向财务分析场景的 Agent 系统，核心策略是：
 
-1. 优先走确定性技能（Skill-first）来提高稳定性和可回归性。  
-2. 未命中技能时，回退到通用 LLM 工作流（Supervisor-Worker + 自愈重试）。  
+1. 默认走 Agent-first 的 Supervisor-Worker 多步编排。  
+2. Agent 重试耗尽时，再切到确定性技能兜底，提高稳定性与可回归性。  
 3. 全链路保留审计信息，最终导出 Excel 交付。  
 4. 使用 Golden Dataset 做回归评测，持续量化成功率与质量。
 
@@ -48,7 +48,7 @@
 3. `app/services/semantic_infer.py`
 4. `app/services/semantic_profile.py`
 5. `app/services/semantic_taxonomy.py`
-6. `app/services/workflow.py`
+6. `app/orchestration/agent_first_graph.py`
 7. `app/services/trusted_exec.py`
 8. `app/utils/tools.py`
 
@@ -74,9 +74,9 @@
 2. 服务器进行自动摄取（Excel/CSV，sheet/header 自动识别）  
 3. 构建语义契约缓存（同请求共享列语义）  
 4. 用户发起 `/chat`  
-5. skill router 判定是否命中 L1/L2/L3/L4  
-6. 命中则执行确定性技能；未命中则进入 workflow（LLM 生成代码）  
-7. 若 workflow 路径则由 trusted executor 沙箱执行代码  
+5. supervisor 生成多步计划并逐步 dispatch  
+6. 每步默认先执行 `agent_worker`，失败后按策略切确定性 skill  
+7. agent 路径由 trusted executor 沙箱执行代码  
 8. 将业务表 + 审计日志 + 结果导出为 Excel  
 9. 返回文本结论、图表 JSON、下载链接、审计摘要
 
@@ -87,7 +87,7 @@
 3. `app/services/semantic_contract.py`
 4. `app/skills/router.py`
 5. `app/skills/engine.py`
-6. `app/services/workflow.py`
+6. `app/orchestration/agent_first_graph.py`
 7. `app/services/trusted_exec.py`
 8. `app/services/exporter.py`
 
@@ -119,7 +119,7 @@
 
 1. 管理 session 生命周期与上下文
 2. 提供 `/upload` `/chat` `/download` `/health`
-3. 控制 skill-first 与 workflow-fallback 路由
+3. 控制 Supervisor v2 多步编排与执行状态续跑
 4. 组织响应结构（结论、图表、下载链接、审计摘要）
 
 你要重点看：
@@ -128,13 +128,13 @@
 2. `upload_files`：文件安全校验 + 自动摄取 + 初始化 workflow
 3. `chat`：
    - 先 `ensure_semantic_contract`
-   - 再 `route_skill`
-   - skill 未命中才跑 `workflow_app.stream`
+   - 再运行 `run_agent_first_workflow`
+   - supervisor 逐步 dispatch，必要时从 agent 切确定性 fallback
 4. `build_export_response`：统一导出和审计摘要拼装
 
 理解点：
 
-1. `dfs_context` 是系统状态总线，技能与 workflow 都围绕它读写。
+1. `dfs_context` 是系统状态总线，agent 与 skills 都围绕它读写。
 2. `__last_result_df__` / `__last_audit__` 是执行阶段和导出阶段的桥梁键。
 
 ---
@@ -224,7 +224,7 @@
 
 关键逻辑：
 
-1. `route_skill`：L3/L1/L2/L4 关键词路由
+1. `route_skill`：catalog-first 意图路由
 2. `execute_skill`：按 skill_name 分发到具体函数
 
 设计取舍：
@@ -347,27 +347,22 @@
 
 ---
 
-## 4.9 Workflow 回退层（通用 LLM Agent）
+## 4.9 Supervisor 编排层（多步 Agent + fallback）
 
-文件：`app/services/workflow.py`
+文件：`app/orchestration/agent_first_graph.py`
 
 职责：
 
-1. Supervisor 决策节点
-2. Python Worker 生成代码
-3. Executor 执行代码并处理重试
-4. 失败自愈与终止控制
+1. 生成全局计划并按步骤执行
+2. 每步先执行 `agent_worker`，失败时可切确定性 fallback
+3. 统一 HITL（approve/revise/reject）与续跑状态
+4. 输出 `execution/route_trace/step_results` 可观测数据
 
 关键点：
 
-1. `build_schema_context` 里注入语义摘要，降低 prompt 注入风险
-2. `MAX_EXEC_RETRIES = 3`
-3. `executor_router` 控制错误重试与正常结束
-
-设计取舍：
-
-1. 优点：具备通用能力，覆盖技能未命中场景。  
-2. 代价：自由代码生成天然不稳定，评测波动更大，故当前架构主张 skill-first。
+1. 主图骨架：`supervisor_plan -> supervisor_dispatch -> worker_execute -> supervisor_review -> finalize`
+2. `agent_worker` 内部 ReAct 重试（当前上限 2）
+3. `supervisor_review` 负责 fallback 切换与 HITL 策略
 
 ---
 
@@ -509,11 +504,11 @@
 
 ## 6. 设计原理与 Tradeoff（面试必讲）
 
-## 6.1 Skill-first vs Workflow-fallback
+## 6.1 Agent-first vs Deterministic Fallback
 
-1. 原理：确定性技能优先，通用 LLM 兜底。  
-2. 优点：稳定性、可回归性、可解释性更高。  
-3. 代价：技能覆盖不到的长尾场景仍需 workflow 承担波动。
+1. 原理：每步先由 agent 执行，重试耗尽后切确定性技能兜底。  
+2. 优点：保留泛化能力，同时在失败时快速收敛到稳定路径。  
+3. 代价：需要额外维护 fallback 映射与策略观测。
 
 ## 6.2 语义契约共享（Semantic Contract）
 

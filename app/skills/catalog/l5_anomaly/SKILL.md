@@ -9,6 +9,15 @@ intent_keywords:
   - outlier
 risk_level: medium
 enabled: true
+capabilities:
+  - anomaly_detection
+  - volatility_analysis
+preconditions:
+  - has_date_and_amount
+hook_templates:
+  - approve_anomaly_threshold
+  - set_threshold
+output_schema: dataframe+insight
 ---
 
 # L5 Anomaly

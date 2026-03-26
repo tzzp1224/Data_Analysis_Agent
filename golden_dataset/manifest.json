@@ -1,6 +1,6 @@
 {
   "dataset_name": "Agentic Finance Golden Dataset",
-  "version": "v1.1.0",
+  "version": "v1.2.0",
   "generated_at_utc": "2026-03-26T12:00:00Z",
   "version_policy": {
     "patch": "v1.0.x: only metadata/evaluation tooling/expectation updates; no case data content changes",
@@ -56,6 +56,40 @@
       "evaluation_focus": [
         "至少生成1张可视化图表",
         "文字洞察可解释 8 月华南异常与 12 月华东峰值"
+      ]
+    },
+    {
+      "case_id": "AMBIGUOUS_KEY_HOOK",
+      "files": [
+        "cases/cleaning_merge/销售台账_脏数据.xlsx",
+        "cases/cleaning_merge/客户主数据_标准库.xlsx"
+      ],
+      "recommended_prompt": "请合并销售台账与客户主数据；若主键存在歧义请发起人工选择，再完成合并。",
+      "evaluation_focus": [
+        "低置信主键场景触发 Hook",
+        "人工选择后继续执行并完成合并"
+      ]
+    },
+    {
+      "case_id": "NOISY_FILE_TRIAGE",
+      "files": [
+        "cases/ingestion/多Sheet_采购入库_带说明.xlsx"
+      ],
+      "recommended_prompt": "请评估该文件数据就绪度；若可恢复则继续清洗并输出审计结果。",
+      "evaluation_focus": [
+        "返回数据就绪度（ready/recoverable/blocked）",
+        "recoverable 场景可继续执行并保留告警"
+      ]
+    },
+    {
+      "case_id": "EXPERT_FORMULA_REVIEW",
+      "files": [
+        "cases/visualization/区域月度经营数据_2024.xlsx"
+      ],
+      "recommended_prompt": "请用复杂自然语言方式完成行列计算并输出结果，若需兜底请走 expert，再做最终审核。",
+      "evaluation_focus": [
+        "未命中常规技能时路由到 expert_excel",
+        "风险场景触发 review_gate 并给出审核结论"
       ]
     },
     {

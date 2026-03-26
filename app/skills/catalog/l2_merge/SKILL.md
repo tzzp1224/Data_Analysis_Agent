@@ -9,6 +9,15 @@ intent_keywords:
   - merge
 risk_level: medium
 enabled: true
+capabilities:
+  - merge
+  - entity_alignment
+preconditions:
+  - has_two_tables
+hook_templates:
+  - select_merge_key
+  - approve_merge
+output_schema: dataframe+audit
 ---
 
 # L2 Merge

@@ -10,6 +10,14 @@ intent_keywords:
   - trend
 risk_level: low
 enabled: true
+capabilities:
+  - trend_analysis
+  - plotting
+preconditions:
+  - has_date_and_amount
+hook_templates:
+  - approve_visual_route
+output_schema: chart+dataframe
 ---
 
 # L4 Visual

@@ -90,6 +90,7 @@ def test_chat_multi_step_execution_payload(monkeypatch):
     assert data["execution"]["current_step_idx"] == 3
     assert len(data["execution"]["plan_steps"]) == 4
     assert len(data["execution"]["step_results"]) == 4
+    assert len(data["execution"]["events"]) >= 2
     assert data["execution"]["route_trace"][0]["prompt_version"] == PROMPT_VERSION
     assert "execution" in data and "artifacts" in data
 
@@ -253,3 +254,72 @@ def test_chat_resume_plan_id_mismatch_is_blocked(monkeypatch):
     assert resp2.status_code == 200
     assert resp2.json()["status"] == "blocked"
     assert session.pending_execution_state is None
+
+
+def test_chat_human_payload_forwarded_and_pending_hook_exposed(monkeypatch):
+    server.sessions.clear()
+    sid = "s-human-payload"
+    _seed_session(sid)
+
+    monkeypatch.setattr(server, "ensure_semantic_contract", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(server, "build_export_response", lambda *_args, **_kwargs: (None, None))
+
+    observed: dict[str, Any] = {}
+
+    def fake_run(*_args, **kwargs):
+        observed["human_payload"] = kwargs.get("human_payload")
+        return {
+            "status": "awaiting_human",
+            "execution_status": "awaiting_human",
+            "reply": "需要人工选择主键",
+            "next_action": "请提供 human_payload",
+            "plan_id": "plan_hook_1",
+            "plan_steps": [
+                _minimal_step("step_01", "l2_merge", status="awaiting_human"),
+            ],
+            "current_step_idx": 0,
+            "step_results": [],
+            "pending_hitl": {"reason": "主键低置信", "error_type": "risk_hook"},
+            "pending_hook": {
+                "hook_id": "hook_123",
+                "hook_type": "select_option",
+                "risk_level": "high",
+                "question": "请选择主键列",
+                "options": [{"label": "客户ID", "value": "客户ID"}],
+                "evidence": {"target": "merge_key_override"},
+                "deadline_hint": "建议人工确认",
+            },
+            "risk_trace": [
+                {"stage": "risk_policy", "action": "hook_triggered", "detail": "merge key low confidence"}
+            ],
+            "route_trace": [_minimal_trace("supervisor_dispatch", "to_hook")],
+            "audit_envelope": [],
+            "chart_jsons": [],
+        }
+
+    monkeypatch.setattr(server, "run_agent_first_workflow", fake_run)
+
+    human_payload = {
+        "hook_id": "hook_123",
+        "decision_type": "select_option",
+        "decision_value": "客户ID",
+        "comment": "使用客户ID作为主键",
+    }
+
+    with TestClient(server.app) as client:
+        resp = client.post(
+            "/chat",
+            json={
+                "session_id": sid,
+                "message": "请继续合并",
+                "human_payload": human_payload,
+            },
+        )
+
+    data = resp.json()
+    assert resp.status_code == 200
+    assert observed["human_payload"] == human_payload
+    assert data["status"] == "awaiting_human"
+    assert data["execution"]["pending_hook"]["hook_type"] == "select_option"
+    assert data["execution"]["pending_hook"]["hook_id"] == "hook_123"
+    assert len(data["execution"]["risk_trace"]) == 1

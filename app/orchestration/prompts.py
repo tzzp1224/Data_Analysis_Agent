@@ -5,7 +5,7 @@ import json
 from app.orchestration.contracts import ALLOWED_WORKERS, INTERNAL_TOOL_SPECS
 
 
-PROMPT_VERSION = "p2.5-lite-2026-03-26"
+PROMPT_VERSION = "p2.6-lite-2026-03-26"
 
 ROUTER_OUTPUT_CONTRACT = {
     "route": "<one worker from candidates>",
@@ -18,6 +18,10 @@ PLANNER_OUTPUT_CONTRACT = {
             "goal": "一句话目标",
             "candidate_workers": ["l1_hygiene"],
             "selected_worker": "l1_hygiene",
+            "confidence": 0.82,
+            "risk_level": "low|medium|high",
+            "intent_source": "llm",
+            "requires_review": False,
             "retry_policy": {
                 "runtime_error_max_retries": 2,
                 "non_retryable_error_types": [
@@ -41,7 +45,9 @@ def planner_system_prompt() -> str:
         "1. 先全局拆解任务，输出按顺序执行的 steps。\n"
         "2. 每个 step 必须包含 goal + candidate_workers + selected_worker + retry_policy。\n"
         "3. selected_worker 必须属于 candidate_workers。\n"
-        "4. 只输出 JSON，不要解释。\n\n"
+        "4. 输出 step confidence(0-1) + risk_level + requires_review。\n"
+        "5. 复杂且低置信任务优先选择 expert_excel。\n"
+        "6. 只输出 JSON，不要解释。\n\n"
         "输出契约:\n"
         f"{contract}"
     )

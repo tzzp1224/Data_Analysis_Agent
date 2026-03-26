@@ -146,10 +146,11 @@ This repository now includes a focused P0 pass for reliability and engineering h
    - Server prebuilds semantic contract for current context.
    - Supervisor generates a global task plan (`plan_steps`) before execution.
    - Each step is dispatched to one worker and reviewed before moving to the next step.
+   - Agent-first policy: each step starts with `agent_worker`; deterministic worker is used only as fallback when agent retries are exhausted.
    - Runtime now uses a single Supervisor v2 chain; legacy `orchestrator/build_task_plan` adapters were removed.
 
 3. **Failure policy + HITL**
-   - `runtime_error`: automatic retry (max 2 per step).
+   - `runtime_error`: agent internal ReAct retry (max 2), then optional deterministic fallback for that same step.
    - `missing_required_columns` / `merge_key_invalid` / `table_selection_failed`: no retry, direct HITL.
    - `approve` resumes from blocked step; `revise` rebuilds plan with new instruction; `reject` terminates execution.
 
@@ -307,13 +308,13 @@ If `GOOGLE_API_KEY` is missing in the backend environment, evaluation exits earl
 
 ## Roadmap (Single Source of Truth)
 
-- **Current stage: P2.5 (Completed / Baseline)**
-  - API and CLI now share the same Supervisor v2 orchestration chain.
-  - Old workflow graph logic is retired into a minimal legacy shim (`app/services/workflow.py`).
-  - `agent_worker` now runs a lightweight ReAct loop (`max_attempts=2`) with context packets and attempt-level observability.
-  - Context engineering is standardized via `ContextPacket` (`system_invariants/plan_slice/schema_digest/memory_slice/error_feedback`).
-  - Skills remain declarative (`SKILL.md`) and deterministic; no external plugin execution or MCP introduced.
-- **Top priority: P2.6**
+- **Current stage: P2.6-Lite (Completed / Baseline)**
+  - UI presets are intentionally reduced to two stable entries: data cleaning and visualization.
+  - API and CLI share the same Supervisor v2 orchestration chain.
+  - Agent-first routing is now the default; deterministic workers engage only as step-level fallback after agent retry exhaustion.
+  - Context engineering remains standardized via `ContextPacket` with attempt-level observability.
+  - Skills remain declarative (`SKILL.md`) and deterministic; no MCP or external plugin execution introduced.
+- **Top priority: P2.7**
   - Expand deterministic reconciliation templates (many-to-one aggregation, tolerance policy, layered diff attribution).
   - Improve production observability dashboards (step latency, retry profile, blocker taxonomy).
 - **P3**

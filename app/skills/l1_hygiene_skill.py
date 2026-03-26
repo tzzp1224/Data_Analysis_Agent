@@ -460,6 +460,25 @@ def run_l2_merge_skill(
             right_semantic=master_sem,
             user_instruction=user_instruction,
         )
+        merge_override = dfs_context.get("__merge_key_override__")
+        if merge_override:
+            override_col = str(merge_override).strip()
+            if override_col in sales_df.columns and override_col in master_df.columns:
+                plan = type(plan)(
+                    left_key=override_col,
+                    right_key=override_col,
+                    key_type="deterministic",
+                    confidence=max(float(plan.confidence), 0.8),
+                    reason=f"人工确认主键 override: {override_col}",
+                    left_quality=plan.left_quality,
+                    right_quality=plan.right_quality,
+                    overlap_ratio=plan.overlap_ratio,
+                    valid=True,
+                    validation_notes=tuple(),
+                )
+                audit.info("HITL主键确认", f"采用人工指定主键: {override_col}", affected_rows=0)
+            dfs_context.pop("__merge_key_override__", None)
+
         if not plan.valid:
             details = "; ".join(plan.validation_notes) or "merge key validation failed"
             return SkillResult(

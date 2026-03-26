@@ -28,6 +28,10 @@ class SkillSpec:
     intent_keywords: tuple[str, ...]
     risk_level: str
     enabled: bool
+    capabilities: tuple[str, ...]
+    preconditions: tuple[str, ...]
+    hook_templates: tuple[str, ...]
+    output_schema: str
     path: str
 
 
@@ -138,6 +142,10 @@ def parse_skill_markdown(path: Path) -> SkillSpec:
         intent_keywords=intent_keywords,
         risk_level=risk_level,
         enabled=_to_bool(payload.get("enabled")),
+        capabilities=_normalize_keywords(payload.get("capabilities")),
+        preconditions=_normalize_keywords(payload.get("preconditions")),
+        hook_templates=_normalize_keywords(payload.get("hook_templates")),
+        output_schema=str(payload.get("output_schema", "")).strip(),
         path=str(path),
     )
 
@@ -260,7 +268,7 @@ def route_worker_from_catalog(
         worker = spec.worker
         if worker in {"l2_merge", "l3_reconcile"} and min_tables < 2:
             continue
-        if worker in {"l1_hygiene", "l4_visual", "l5_anomaly"} and min_tables < 1:
+        if worker in {"l1_hygiene", "l4_visual", "l5_anomaly", "expert_excel"} and min_tables < 1:
             continue
         return worker
     return None

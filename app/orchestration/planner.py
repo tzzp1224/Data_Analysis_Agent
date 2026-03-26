@@ -72,6 +72,8 @@ def _normalize_worker(value: Any) -> str:
     worker = str(value or "").strip().lower()
     alias = {
         "agent": "agent_worker",
+        "expert": "expert_excel",
+        "expert_excel": "expert_excel",
         "worker": "agent_worker",
         "l1": "l1_hygiene",
         "l2": "l2_merge",
@@ -105,19 +107,54 @@ def _business_table_count(dfs_context: Dict[str, pd.DataFrame]) -> int:
 def _is_worker_applicable(worker: str, table_count: int) -> bool:
     if worker in {"l2_merge", "l3_reconcile"}:
         return table_count >= 2
-    if worker in {"l1_hygiene", "l4_visual", "l5_anomaly", "agent_worker"}:
+    if worker in {"l1_hygiene", "l4_visual", "l5_anomaly", "agent_worker", "expert_excel"}:
         return table_count >= 1
     return False
 
 
-def _make_step(worker: str, *, idx: int, goal: str = "") -> PlanStep:
-    selected_worker = _normalize_worker(worker)
+def _worker_risk_level(worker: str) -> str:
+    mapping = {
+        "l3_reconcile": "high",
+        "l2_merge": "high",
+        "l1_hygiene": "medium",
+        "expert_excel": "medium",
+        "l5_anomaly": "medium",
+        "l4_visual": "low",
+        "agent_worker": "medium",
+    }
+    return mapping.get(worker, "low")
+
+
+def _build_step_topology(worker: str) -> tuple[list[str], str, str]:
+    intended = _normalize_worker(worker)
+    if intended in {"l1_hygiene", "l2_merge", "l3_reconcile", "l4_visual", "l5_anomaly", "expert_excel"}:
+        return [intended, "agent_worker"], intended, "agent_worker"
+    return ["agent_worker"], "agent_worker", ""
+
+
+def _make_step(
+    worker: str,
+    *,
+    idx: int,
+    goal: str = "",
+    confidence: float = 0.7,
+    intent_source: str = "fallback",
+) -> PlanStep:
+    intended_worker = _normalize_worker(worker)
+    candidate_workers, selected_worker, fallback_worker = _build_step_topology(intended_worker)
+    risk_level = _worker_risk_level(selected_worker)
     return PlanStep(
         step_id=f"step_{idx:02d}",
-        goal=goal or WORKER_GOALS.get(selected_worker, "执行任务步骤"),
-        candidate_workers=[selected_worker],
+        goal=goal or WORKER_GOALS.get(intended_worker, "执行任务步骤"),
+        candidate_workers=candidate_workers,
         selected_worker=selected_worker,
-        retry_policy=_default_retry_policy(selected_worker),
+        fallback_worker=fallback_worker,
+        fallback_attempted=False,
+        retry_policy=_default_retry_policy(intended_worker),
+        confidence=max(0.0, min(float(confidence or 0.5), 1.0)),
+        risk_level=risk_level,
+        intent_source=intent_source,
+        requires_review=risk_level in {"high", "medium"} and selected_worker in {"l2_merge", "l3_reconcile", "expert_excel"},
     )
 
 
@@ -147,7 +184,7 @@ def _build_fallback_steps(user_instruction: str, dfs_context: Dict[str, pd.DataF
 
     workers = [w for w in workers if _is_worker_applicable(w, table_count)]
     if not workers and table_count >= 1:
-        workers = ["agent_worker"]
+        workers = ["expert_excel"]
 
     deduped: list[str] = []
     for worker in workers:
@@ -155,7 +192,15 @@ def _build_fallback_steps(user_instruction: str, dfs_context: Dict[str, pd.DataF
             continue
         deduped.append(worker)
 
-    return [_make_step(worker, idx=i) for i, worker in enumerate(deduped[:_MAX_STEPS], start=1)]
+    return [
+        _make_step(
+            worker,
+            idx=i,
+            confidence=0.65 if worker == "expert_excel" else 0.78,
+            intent_source="fallback_rule",
+        )
+        for i, worker in enumerate(deduped[:_MAX_STEPS], start=1)
+    ]
 
 
 def _parse_llm_steps(payload: dict, table_count: int) -> list[PlanStep]:
@@ -185,6 +230,11 @@ def _parse_llm_steps(payload: dict, table_count: int) -> list[PlanStep]:
         retry_policy = item.get("retry_policy") if isinstance(item.get("retry_policy"), dict) else {}
         merged_retry = _default_retry_policy(selected)
         merged_retry.update(retry_policy)
+        confidence = float(item.get("confidence", 0.72) or 0.72)
+        risk_level = str(item.get("risk_level", _worker_risk_level(selected)) or _worker_risk_level(selected))
+        intent_source = str(item.get("intent_source", "llm") or "llm")
+        requires_review = bool(item.get("requires_review", risk_level in {"high"}))
+        fallback_worker = "agent_worker" if selected != "agent_worker" else ""
 
         steps.append(
             PlanStep(
@@ -192,13 +242,21 @@ def _parse_llm_steps(payload: dict, table_count: int) -> list[PlanStep]:
                 goal=goal or WORKER_GOALS.get(selected, "执行任务步骤"),
                 candidate_workers=candidates,
                 selected_worker=selected,
+                fallback_worker=fallback_worker,
+                fallback_attempted=False,
                 retry_policy=merged_retry,
+                confidence=max(0.0, min(confidence, 1.0)),
+                risk_level=risk_level,
+                intent_source=intent_source,
+                requires_review=requires_review,
             )
         )
 
     deduped: list[PlanStep] = []
     for step in steps:
-        if deduped and deduped[-1].selected_worker == step.selected_worker:
+        dedupe_key = step.selected_worker
+        prev_key = deduped[-1].selected_worker if deduped else ""
+        if deduped and prev_key == dedupe_key:
             continue
         deduped.append(step)
     return deduped

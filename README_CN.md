@@ -145,10 +145,11 @@
    - 先为当前上下文构建语义契约。
    - supervisor 先生成全局计划（`plan_steps`），再逐步执行。
    - 每一步执行后进入 `supervisor_review`，通过后再路由下一步。
+   - 默认 Agent-first：每步先由 `agent_worker` 执行；仅当 agent 重试耗尽时才切到确定性 worker 兜底。
    - 运行时已收敛为单一 Supervisor v2 主链路，旧 `orchestrator/build_task_plan` 适配层已移除。
 
 3. **失败策略与 HITL**
-   - `runtime_error`：自动重试（每步最多 2 次）。
+   - `runtime_error`：agent 内部 ReAct 自动重试（每步最多 2 次），耗尽后可切同一步确定性 worker 兜底。
    - `missing_required_columns` / `merge_key_invalid` / `table_selection_failed`：不重试，直接进入 HITL。
    - `approve` 从阻断步骤续跑；`revise` 按新指令重规划；`reject` 终止计划。
 
@@ -306,13 +307,13 @@ python golden_dataset/run_evaluation.py --api-url http://localhost:8000
 
 ## Roadmap（唯一事实来源）
 
-- **当前阶段：P2.5（已完成，作为基线）**
+- **当前阶段：P2.6-Lite（已完成，作为基线）**
+  - 前端业务预设收敛为两个稳定入口：数据清理、数据可视化。
   - API 与 CLI 已统一到同一套 Supervisor v2 编排链路。
-  - 旧 workflow 图已退场，`app/services/workflow.py` 仅保留最小 legacy shim。
-  - `agent_worker` 内部加入轻量 ReAct 小循环（`max_attempts=2`），并带有每次尝试级可观测性。
+  - 默认采用 Agent-first 路由；仅在 agent 重试耗尽后切确定性 worker 兜底。
   - 上下文工程统一为 `ContextPacket`（`system_invariants/plan_slice/schema_digest/memory_slice/error_feedback`）。
   - skills 继续采用声明式 `SKILL.md` 路由，不开放插件执行，不引入 MCP。
-- **最高优先级：P2.6**
+- **最高优先级：P2.7**
   - 扩展确定性对账修复模板（多对一聚合、容差策略、差异归因分层）。
   - 增强生产可观测性看板（step 延迟、重试画像、阻断类型画像）。
 - **P3**

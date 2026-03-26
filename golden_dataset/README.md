@@ -42,7 +42,7 @@ python golden_dataset/run_evaluation.py --api-url http://localhost:8000
 - 变更记录见：`CHANGELOG.md`
 
 ## 版本
-- 当前版本：`v1.1.0`
+- 当前版本：`v1.2.0`
 
 ## 重新生成
 ```bash

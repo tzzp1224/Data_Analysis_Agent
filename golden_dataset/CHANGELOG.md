@@ -2,6 +2,13 @@
 
 All notable changes to the golden dataset are documented in this file.
 
+## [v1.2.0] - 2026-03-26
+- Added HITL / Expert / Review focused regression cases:
+  - `AMBIGUOUS_KEY_HOOK`: validates proactive hook triggering and resume after manual key selection.
+  - `NOISY_FILE_TRIAGE`: validates data readiness triage path (`ready/recoverable/blocked`).
+  - `EXPERT_FORMULA_REVIEW`: validates expert fallback route and risk-based final review.
+- Updated `manifest.json` and `expected_snapshots.json` with corresponding assertions.
+
 ## [v1.1.0] - 2026-03-26
 - Added multi-step supervisor regression case:
   - New case `MULTI_STEP_SUPERVISOR_CHAIN` validates sequential routing (`clean -> merge -> reconcile -> visual`).

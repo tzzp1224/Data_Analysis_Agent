@@ -19,6 +19,11 @@ from app.orchestration.agent_worker_runtime import (
     python_worker_node,
 )
 from app.orchestration.contracts import ALLOWED_WORKERS, StepScratchpad, WORKER_CAPABILITIES
+from app.orchestration.risk_policy import (
+    build_pending_hook_for_failure,
+    evaluate_pre_execution_risk,
+    normalize_human_payload,
+)
 from app.orchestration.planner import build_task_plan_v2
 from app.orchestration.prompts import PROMPT_VERSION, router_system_prompt
 from app.services.llm_factory import get_llm
@@ -161,6 +166,7 @@ class AgentFirstState(TypedDict):
     messages: Annotated[List[BaseMessage], operator.add]
     user_instruction: str
     human_action: str
+    human_payload: Dict[str, Any]
     resume_plan_id: str
     pending_state: Dict[str, Any]
 
@@ -178,10 +184,13 @@ class AgentFirstState(TypedDict):
     reply: str
     next_action: str
     pending_hitl: Dict[str, Any]
+    pending_hook: Dict[str, Any]
+    hook_decisions: Dict[str, Any]
 
     route_trace: Annotated[List[dict], operator.add]
     audit_envelope: Annotated[List[dict], operator.add]
     chart_jsons: Annotated[List[str], operator.add]
+    risk_trace: Annotated[List[dict], operator.add]
 
 
 def _event(stage: str, action: str, detail: str, **extra: Any) -> dict:
@@ -222,12 +231,21 @@ def _coerce_step_dict(step: dict, fallback_id: str) -> dict:
     candidates = [str(item).strip() for item in step.get("candidate_workers", []) if str(item).strip()]
     if selected and selected not in candidates:
         candidates = [selected] + candidates
+    fallback_worker = str(step.get("fallback_worker", "")).strip()
+    if fallback_worker and fallback_worker not in ALLOWED_WORKERS:
+        fallback_worker = ""
     return {
         "step_id": str(step.get("step_id", fallback_id)).strip() or fallback_id,
         "goal": str(step.get("goal", "")).strip(),
         "candidate_workers": candidates,
         "selected_worker": selected,
+        "fallback_worker": fallback_worker,
+        "fallback_attempted": bool(step.get("fallback_attempted", False)),
         "retry_policy": dict(step.get("retry_policy") or {}),
+        "confidence": float(step.get("confidence", 0.5) or 0.5),
+        "risk_level": str(step.get("risk_level", "low")).strip() or "low",
+        "intent_source": str(step.get("intent_source", "planner")).strip() or "planner",
+        "requires_review": bool(step.get("requires_review", False)),
         "status": str(step.get("status", "pending")).strip() or "pending",
         "retry_count": int(step.get("retry_count", 0) or 0),
         "error_type": str(step.get("error_type", "")).strip(),
@@ -250,10 +268,14 @@ def _normalize_plan_steps(raw_steps: list[dict]) -> list[dict]:
 
 
 def _build_plan_summary(steps: list[dict]) -> str:
-    lines = [
-        f"{idx}. {step.get('selected_worker')} - {step.get('goal') or '执行步骤'}"
-        for idx, step in enumerate(steps, start=1)
-    ]
+    lines: list[str] = []
+    for idx, step in enumerate(steps, start=1):
+        selected = str(step.get("selected_worker", "")).strip() or "agent_worker"
+        fallback_worker = str(step.get("fallback_worker", "")).strip()
+        route_hint = selected
+        if fallback_worker:
+            route_hint = f"{selected} -> {fallback_worker}"
+        lines.append(f"{idx}. {route_hint} - {step.get('goal') or '执行步骤'}")
     return "\n".join(lines)
 
 
@@ -275,11 +297,23 @@ def _build_done_reply(plan_steps: list[dict], step_results: list[dict]) -> str:
 def supervisor_plan_node(state: AgentFirstState, dfs_context: Dict[str, pd.DataFrame]):
     instruction = str(state.get("user_instruction", "")).strip()
     human_action = str(state.get("human_action", "")).strip().lower()
+    human_payload = normalize_human_payload(state.get("human_payload"))
+    decision_type = str(human_payload.get("decision_type", "")).strip().lower()
+    if (not human_action) and decision_type in {"approve", "reject", "revise"}:
+        human_action = decision_type
     resume_plan_id = str(state.get("resume_plan_id", "")).strip()
     pending = state.get("pending_state") or {}
 
     if pending:
         pending_plan_id = str(pending.get("plan_id", "")).strip()
+        pending_hook = dict(pending.get("pending_hook") or pending.get("pending_hitl") or {})
+        pending_hook_evidence = dict(pending_hook.get("evidence") or {})
+        pending_reason = (
+            str(pending_hook_evidence.get("reason", "")).strip()
+            or str(pending_hook.get("reason", "")).strip()
+            or str(pending.get("pending_hitl", {}).get("reason", "")).strip()
+            or "任务等待人工确认。"
+        )
         if resume_plan_id and pending_plan_id and resume_plan_id != pending_plan_id:
             event = _event("supervisor_plan", "resume_plan_mismatch", "resume_plan_id 与待续跑计划不一致。")
             return {
@@ -291,21 +325,24 @@ def supervisor_plan_node(state: AgentFirstState, dfs_context: Dict[str, pd.DataF
                 "audit_envelope": [event],
             }
 
-        if not human_action:
-            reason = str(pending.get("pending_hitl", {}).get("reason", "任务等待人工确认。")).strip()
-            event = _event("supervisor_plan", "await_human", reason, plan_id=pending_plan_id)
+        waiting_human = (not human_action) and (not decision_type)
+        if waiting_human:
+            event = _event("supervisor_plan", "await_human", pending_reason, plan_id=pending_plan_id)
             return {
                 "router_decision": "finalize",
                 "status": "awaiting_human",
                 "execution_status": "awaiting_human",
-                "reply": f"🧑‍⚖️ 任务等待人工确认。\n\n原因：{reason}",
-                "next_action": "请提供 human_action=approve|reject|revise。",
+                "reply": f"🧑‍⚖️ 任务等待人工确认。\n\n原因：{pending_reason}",
+                "next_action": "请提供 human_action 或 human_payload（approve/reject/revise/select_option/map_columns/set_threshold）。",
                 "route_trace": [event],
                 "audit_envelope": [event],
                 "plan_id": pending_plan_id,
                 "plan_steps": list(pending.get("plan_steps") or []),
                 "current_step_idx": int(pending.get("current_step_idx", 0) or 0),
                 "step_results": list(pending.get("step_results") or []),
+                "pending_hook": pending_hook,
+                "pending_hitl": {"reason": pending_reason},
+                "hook_decisions": dict(pending.get("hook_decisions") or {}),
             }
 
         if human_action == "reject":
@@ -318,6 +355,7 @@ def supervisor_plan_node(state: AgentFirstState, dfs_context: Dict[str, pd.DataF
                 "next_action": "可提交新指令重新规划。",
                 "route_trace": [event],
                 "audit_envelope": [event],
+                "pending_hook": {},
                 "pending_hitl": {},
                 "plan_id": pending_plan_id,
                 "plan_steps": list(pending.get("plan_steps") or []),
@@ -328,19 +366,33 @@ def supervisor_plan_node(state: AgentFirstState, dfs_context: Dict[str, pd.DataF
         if human_action == "revise":
             event = _event("supervisor_plan", "human_revise", "人工要求按新指令重规划。")
             pending = {}
-        elif human_action == "approve":
+        elif human_action == "approve" or decision_type in {"select_option", "map_columns", "set_threshold"}:
             plan_steps = _normalize_plan_steps(list(pending.get("plan_steps") or []))
             idx = int(pending.get("current_step_idx", 0) or 0)
+            hook_decisions = dict(pending.get("hook_decisions") or {})
+            if pending_hook:
+                hook_id = str(human_payload.get("hook_id", "")).strip() or str(
+                    pending_hook.get("hook_id", "manual_hook")
+                ).strip()
+                if decision_type:
+                    hook_decisions[hook_id] = dict(human_payload)
+                target = str((pending_hook.get("evidence") or {}).get("target", "")).strip()
+                if target == "merge_key_override" and human_payload.get("decision_value"):
+                    dfs_context["__merge_key_override__"] = str(human_payload.get("decision_value"))
+                if target == "data_readiness":
+                    dfs_context["__data_readiness_ack__"] = True
             event = _event("supervisor_plan", "human_approve", "人工确认后恢复执行。", plan_id=pending_plan_id)
             return {
                 "router_decision": "supervisor_dispatch",
                 "status": "running",
                 "execution_status": "running",
+                "pending_hook": {},
                 "pending_hitl": {},
                 "plan_id": pending_plan_id,
                 "plan_steps": plan_steps,
                 "current_step_idx": idx,
                 "step_results": list(pending.get("step_results") or []),
+                "hook_decisions": hook_decisions,
                 "next_action": "",
                 "route_trace": [event],
                 "audit_envelope": [event],
@@ -351,14 +403,17 @@ def supervisor_plan_node(state: AgentFirstState, dfs_context: Dict[str, pd.DataF
                 "router_decision": "finalize",
                 "status": "awaiting_human",
                 "execution_status": "awaiting_human",
-                "reply": "无效 human_action。请使用 approve / reject / revise。",
-                "next_action": "重试并提供有效 human_action。",
+                "reply": "无效人工决策。请使用 approve / reject / revise 或提供 human_payload。",
+                "next_action": "重试并提供有效决策。",
                 "route_trace": [event],
                 "audit_envelope": [event],
                 "plan_id": pending_plan_id,
                 "plan_steps": list(pending.get("plan_steps") or []),
                 "current_step_idx": int(pending.get("current_step_idx", 0) or 0),
                 "step_results": list(pending.get("step_results") or []),
+                "pending_hook": pending_hook,
+                "pending_hitl": {"reason": pending_reason},
+                "hook_decisions": dict(pending.get("hook_decisions") or {}),
             }
 
     plan = build_task_plan_v2(instruction, dfs_context)
@@ -395,6 +450,7 @@ def supervisor_plan_node(state: AgentFirstState, dfs_context: Dict[str, pd.DataF
         "current_step_idx": 0,
         "reply": f"### 🧭 Supervisor 计划\n\n{summary}",
         "step_results": [],
+        "hook_decisions": dict(state.get("hook_decisions") or {}),
         "next_action": "",
         "route_trace": [event],
         "audit_envelope": [event],
@@ -403,6 +459,7 @@ def supervisor_plan_node(state: AgentFirstState, dfs_context: Dict[str, pd.DataF
 
 def supervisor_dispatch_node(
     state: AgentFirstState,
+    dfs_context: Dict[str, pd.DataFrame],
     official_supervisor_app=None,
 ):
     steps = list(state.get("plan_steps") or [])
@@ -438,6 +495,40 @@ def supervisor_dispatch_node(
     step["status"] = "running"
     steps[idx] = step
 
+    risk_decision = evaluate_pre_execution_risk(
+        instruction=str(state.get("user_instruction", "")),
+        step=step,
+        dfs_context=dfs_context,
+        step_results=list(state.get("step_results") or []),
+    )
+    risk_trace = list(risk_decision.risk_trace or [])
+    if risk_decision.pending_hook is not None:
+        step["status"] = "awaiting_human"
+        steps[idx] = step
+        hook_payload = risk_decision.pending_hook.to_dict()
+        hook_event = _event(
+            "supervisor_dispatch",
+            "to_hook",
+            f"step={step.get('step_id')} hook={hook_payload.get('hook_type')}",
+            current_step_idx=idx,
+        )
+        return {
+            "router_decision": "finalize",
+            "status": "awaiting_human",
+            "execution_status": "awaiting_human",
+            "pending_hook": hook_payload,
+            "pending_hitl": {"reason": hook_payload.get("question", "需要人工确认"), "error_type": "risk_hook"},
+            "next_action": "请提供 human_action 或 human_payload 来确认/选择。",
+            "reply": f"🧑‍⚖️ 风险策略触发人工确认：{hook_payload.get('question', '')}",
+            "plan_steps": steps,
+            "current_step_idx": idx,
+            "step_results": list(state.get("step_results") or []),
+            "hook_decisions": dict(state.get("hook_decisions") or {}),
+            "route_trace": [hook_event],
+            "audit_envelope": [hook_event],
+            "risk_trace": risk_trace,
+        }
+
     event = _event(
         "supervisor_dispatch",
         "dispatch",
@@ -451,6 +542,8 @@ def supervisor_dispatch_node(
         "plan_steps": steps,
         "status": "running",
         "execution_status": "running",
+        "risk_trace": risk_trace,
+        "hook_decisions": dict(state.get("hook_decisions") or {}),
         "route_trace": [event],
         "audit_envelope": [event],
     }
@@ -587,7 +680,11 @@ def _run_skill_worker(
     instruction: str,
     dfs_context: Dict[str, pd.DataFrame],
 ) -> dict[str, Any]:
-    result = execute_skill(worker, dfs_context, instruction)
+    envelope = execute_skill(worker, dfs_context, instruction)
+    result = envelope.result if envelope else None
+    envelope_precheck = dict(envelope.precheck) if envelope else {}
+    envelope_postcheck = dict(envelope.postcheck) if envelope else {}
+    envelope_evidence = dict(envelope.evidence) if envelope else {}
 
     base_audit = dfs_context.get("__last_audit__")
     if result and result.audit:
@@ -609,13 +706,16 @@ def _run_skill_worker(
                 "handled": True,
                 "blocked": False,
                 "error_type": "",
-                "summary": result.response_text or f"{worker} 执行成功",
+                "summary": result.change_summary or result.response_text or f"{worker} 执行成功",
                 "response_text": result.response_text or "",
                 "worker_log": "",
                 "attempt": 1,
                 "observation": f"deterministic skill `{worker}` succeeded.",
                 "validation_status": "passed",
                 "context_fingerprint": "",
+                "precheck": envelope_precheck,
+                "postcheck": envelope_postcheck,
+                "evidence": envelope_evidence,
             },
             "chart_jsons": charts,
         }
@@ -640,6 +740,9 @@ def _run_skill_worker(
             "observation": f"deterministic skill `{worker}` failed: {summary[:180]}",
             "validation_status": "failed",
             "context_fingerprint": "",
+            "precheck": envelope_precheck,
+            "postcheck": envelope_postcheck,
+            "evidence": envelope_evidence,
         },
         "chart_jsons": charts,
     }
@@ -730,6 +833,9 @@ def supervisor_review_node(state: AgentFirstState):
         "attempt": int(execution.get("attempt", 1) or 1),
         "observation": str(execution.get("observation", "")).strip(),
         "validation_status": str(execution.get("validation_status", "")).strip(),
+        "precheck": dict(execution.get("precheck") or {}),
+        "postcheck": dict(execution.get("postcheck") or {}),
+        "evidence": dict(execution.get("evidence") or {}),
     }
 
     if handled:
@@ -740,11 +846,11 @@ def supervisor_review_node(state: AgentFirstState):
 
         if idx + 1 >= len(steps):
             done_reply = _build_done_reply(steps, list(state.get("step_results") or []) + [step_result])
-            event = _event("supervisor_review", "done", "全部步骤执行完成。")
+            event = _event("supervisor_review", "to_review_gate", "全部步骤执行完成，进入最终审核。")
             return {
-                "router_decision": "finalize",
-                "status": "done",
-                "execution_status": "done",
+                "router_decision": "review_gate",
+                "status": "running",
+                "execution_status": "reviewing",
                 "reply": done_reply,
                 "plan_steps": steps,
                 "current_step_idx": idx,
@@ -766,6 +872,48 @@ def supervisor_review_node(state: AgentFirstState):
             "execution_status": "running",
             "plan_steps": steps,
             "current_step_idx": next_idx,
+            "step_results": [step_result],
+            "route_trace": [event],
+            "audit_envelope": [event],
+        }
+
+    fallback_worker = str(step.get("fallback_worker", "")).strip()
+    fallback_attempted = bool(step.get("fallback_attempted", False))
+    validation_status = str(execution.get("validation_status", "")).strip()
+    should_fallback = (
+        error_type == "runtime_error"
+        and fallback_worker in ALLOWED_WORKERS
+        and fallback_worker != worker
+        and (not fallback_attempted)
+        and (
+            (worker == "agent_worker" and validation_status == "retry_exhausted")
+            or (worker != "agent_worker")
+        )
+    )
+    if should_fallback:
+        step["selected_worker"] = fallback_worker
+        step["candidate_workers"] = [fallback_worker, "agent_worker"] if fallback_worker != "agent_worker" else [fallback_worker]
+        step["fallback_attempted"] = True
+        step["status"] = "pending"
+        step["error_type"] = error_type
+        step["summary"] = summary
+        steps[idx] = step
+
+        event = _event(
+            "supervisor_review",
+            "fallback_to_deterministic",
+            f"{worker} 失败后切换 worker: {fallback_worker}",
+            from_worker=worker,
+            to_worker=fallback_worker,
+            error_type=error_type,
+            step_id=step.get("step_id"),
+        )
+        return {
+            "router_decision": "supervisor_dispatch",
+            "status": "running",
+            "execution_status": "running",
+            "plan_steps": steps,
+            "current_step_idx": idx,
             "step_results": [step_result],
             "route_trace": [event],
             "audit_envelope": [event],
@@ -813,10 +961,8 @@ def supervisor_review_node(state: AgentFirstState):
     steps[idx] = step
 
     reason = summary
-    pending_hitl = {
-        "reason": reason,
-        "error_type": error_type,
-    }
+    pending_hook = build_pending_hook_for_failure(reason=reason, error_type=error_type)
+    pending_hitl = {"reason": reason, "error_type": error_type}
 
     event = _event(
         "supervisor_review",
@@ -829,14 +975,103 @@ def supervisor_review_node(state: AgentFirstState):
         "router_decision": "finalize",
         "status": "awaiting_human",
         "execution_status": "awaiting_human",
+        "pending_hook": pending_hook,
         "pending_hitl": pending_hitl,
         "reply": f"🧑‍⚖️ 步骤 `{step.get('step_id')}` 执行失败并进入人工确认。\n\n原因：{reason}",
-        "next_action": "human_action=approve|reject|revise",
+        "next_action": "human_action=approve|reject|revise 或提交 human_payload。",
         "plan_steps": steps,
         "current_step_idx": idx,
         "step_results": [step_result],
         "route_trace": [event],
         "audit_envelope": [event],
+    }
+
+
+def review_gate_node(state: AgentFirstState, dfs_context: Dict[str, pd.DataFrame]):
+    reply = str(state.get("reply", "")).strip() or "执行完成。"
+    instruction = str(state.get("user_instruction", "")).strip()
+    steps = list(state.get("plan_steps") or [])
+    step_results = list(state.get("step_results") or [])
+    chart_jsons = list(state.get("chart_jsons") or [])
+    route_trace = list(state.get("route_trace") or [])
+
+    high_risk_workers = {"l2_merge", "l3_reconcile", "expert_excel"}
+    used_high_risk = any(str(step.get("selected_worker", "")).strip() in high_risk_workers for step in steps)
+    used_fallback = any(str(item.get("action", "")).strip() == "fallback_to_deterministic" for item in route_trace)
+    strict_requested = any(token in instruction for token in ("严格", "强清洗", "删除异常", "剔除"))
+    should_review = bool(used_high_risk or used_fallback or strict_requested)
+
+    if not should_review:
+        event = _event("review_gate", "skipped", "未命中风险条件，跳过最终审核。")
+        return {
+            "router_decision": "finalize",
+            "status": "done",
+            "execution_status": "done",
+            "reply": reply,
+            "route_trace": [event],
+            "audit_envelope": [event],
+            "risk_trace": [
+                {
+                    "stage": "review_gate",
+                    "action": "review_skipped",
+                    "detail": "risk conditions not met",
+                    "timestamp": event.get("timestamp"),
+                }
+            ],
+        }
+
+    issues: list[str] = []
+    if not step_results:
+        issues.append("缺少步骤执行结果，无法核验是否符合用户意图。")
+    if used_high_risk and dfs_context.get("__last_audit__") is None:
+        issues.append("高风险任务缺少审计记录。")
+    if ("可视化" in instruction or "图表" in instruction) and not chart_jsons:
+        issues.append("用户请求图表但未产出 chart_jsons。")
+
+    if issues:
+        reason = "；".join(issues)
+        pending_hook = build_pending_hook_for_failure(reason=reason, error_type="review_failed")
+        pending_hook["hook_type"] = "approve"
+        pending_hook["risk_level"] = "high"
+        pending_hook["question"] = f"最终审核未通过：{reason}。是否人工确认后继续交付？"
+
+        event = _event("review_gate", "review_failed", reason)
+        return {
+            "router_decision": "finalize",
+            "status": "awaiting_human",
+            "execution_status": "awaiting_human",
+            "reply": f"🧾 最终审核未通过，进入人工确认。\n\n原因：{reason}",
+            "next_action": "human_action=approve|reject|revise 或提交 human_payload。",
+            "pending_hook": pending_hook,
+            "pending_hitl": {"reason": reason, "error_type": "review_failed"},
+            "route_trace": [event],
+            "audit_envelope": [event],
+            "risk_trace": [
+                {
+                    "stage": "review_gate",
+                    "action": "review_failed",
+                    "detail": reason,
+                    "timestamp": event.get("timestamp"),
+                }
+            ],
+        }
+
+    event = _event("review_gate", "review_passed", "风险任务审核通过。")
+    return {
+        "router_decision": "finalize",
+        "status": "done",
+        "execution_status": "done",
+        "reply": f"{reply}\n\n✅ Review Gate: 已通过风险审核。",
+        "route_trace": [event],
+        "audit_envelope": [event],
+        "risk_trace": [
+            {
+                "stage": "review_gate",
+                "action": "review_passed",
+                "detail": "review checks passed",
+                "timestamp": event.get("timestamp"),
+            }
+        ],
     }
 
 
@@ -873,7 +1108,7 @@ def plan_router(state: AgentFirstState):
 
 def review_router(state: AgentFirstState):
     decision = str(state.get("router_decision", "finalize")).strip()
-    if decision in {"supervisor_dispatch", "finalize"}:
+    if decision in {"supervisor_dispatch", "review_gate", "finalize"}:
         return decision
     return "finalize"
 
@@ -906,13 +1141,18 @@ def create_agent_first_workflow(
     workflow.add_node("supervisor_plan", partial(supervisor_plan_node, dfs_context=dfs_context))
     workflow.add_node(
         "supervisor_dispatch",
-        partial(supervisor_dispatch_node, official_supervisor_app=official_router_app),
+        partial(
+            supervisor_dispatch_node,
+            dfs_context=dfs_context,
+            official_supervisor_app=official_router_app,
+        ),
     )
     workflow.add_node(
         "worker_execute",
         partial(worker_execute_node, dfs_context=dfs_context, backups_context=backups_context),
     )
     workflow.add_node("supervisor_review", supervisor_review_node)
+    workflow.add_node("review_gate", partial(review_gate_node, dfs_context=dfs_context))
     workflow.add_node("finalize", finalize_node)
 
     workflow.set_entry_point("supervisor_plan")
@@ -931,9 +1171,11 @@ def create_agent_first_workflow(
         review_router,
         {
             "supervisor_dispatch": "supervisor_dispatch",
+            "review_gate": "review_gate",
             "finalize": "finalize",
         },
     )
+    workflow.add_edge("review_gate", "finalize")
     workflow.add_edge("finalize", END)
 
     return workflow.compile()
@@ -944,6 +1186,7 @@ def run_agent_first_workflow(
     *,
     user_instruction: str,
     human_action: str = "",
+    human_payload: Optional[dict] = None,
     pending_state: Optional[dict] = None,
     resume_plan_id: str = "",
 ) -> dict:
@@ -951,6 +1194,7 @@ def run_agent_first_workflow(
         "messages": [],
         "user_instruction": str(user_instruction or ""),
         "human_action": str(human_action or ""),
+        "human_payload": normalize_human_payload(human_payload),
         "resume_plan_id": str(resume_plan_id or ""),
         "pending_state": dict(pending_state or {}),
         "plan_id": "",
@@ -964,9 +1208,12 @@ def run_agent_first_workflow(
         "status": "running",
         "reply": "",
         "next_action": "",
+        "pending_hook": {},
         "pending_hitl": {},
+        "hook_decisions": {},
         "route_trace": [],
         "audit_envelope": [],
         "chart_jsons": [],
+        "risk_trace": [],
     }
     return app.invoke(initial_state, config={"recursion_limit": 120})

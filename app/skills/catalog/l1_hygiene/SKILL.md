@@ -9,6 +9,15 @@ intent_keywords:
   - hygiene
 risk_level: low
 enabled: true
+capabilities:
+  - clean
+  - dedup
+  - anomaly_warning
+preconditions:
+  - has_business_table
+hook_templates:
+  - approve_high_impact_cleaning
+output_schema: dataframe+audit
 ---
 
 # L1 Hygiene

@@ -7,6 +7,7 @@ from typing import Any
 
 ALLOWED_WORKERS = (
     "agent_worker",
+    "expert_excel",
     "l1_hygiene",
     "l2_merge",
     "l3_reconcile",
@@ -20,11 +21,13 @@ WORKER_ORDER = (
     "l3_reconcile",
     "l4_visual",
     "l5_anomaly",
+    "expert_excel",
     "agent_worker",
 )
 
 WORKER_GOALS: dict[str, str] = {
     "agent_worker": "执行通用 agent 任务",
+    "expert_excel": "执行复杂自然语言 Excel 操作的结构化兜底",
     "l1_hygiene": "执行数据体检与语义增强清洗",
     "l2_merge": "执行主数据对齐与合并",
     "l3_reconcile": "执行财务对账",
@@ -34,6 +37,7 @@ WORKER_GOALS: dict[str, str] = {
 
 WORKER_CAPABILITIES: dict[str, str] = {
     "agent_worker": "General-purpose agent execution for uncategorized requests.",
+    "expert_excel": "Expert fallback for complex or low-confidence Excel instructions.",
     "l1_hygiene": "Data hygiene and semantic cleaning.",
     "l2_merge": "Entity alignment and table merge.",
     "l3_reconcile": "Finance reconciliation.",
@@ -84,7 +88,13 @@ class PlanStep:
     goal: str
     candidate_workers: list[str] = field(default_factory=list)
     selected_worker: str = ""
+    fallback_worker: str = ""
+    fallback_attempted: bool = False
     retry_policy: dict[str, Any] = field(default_factory=dict)
+    confidence: float = 0.5
+    risk_level: str = "low"
+    intent_source: str = "planner"
+    requires_review: bool = False
     status: str = "pending"
     retry_count: int = 0
     error_type: str = ""

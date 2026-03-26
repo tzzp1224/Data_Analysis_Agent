@@ -24,3 +24,15 @@ class SkillResult:
     error: Optional[str] = None
     blocked: bool = False
     error_type: Optional[str] = None
+    evidence: dict = field(default_factory=dict)
+    change_summary: str = ""
+
+
+@dataclass
+class SkillResultEnvelope:
+    skill_name: str
+    result: SkillResult
+    precheck: dict = field(default_factory=dict)
+    postcheck: dict = field(default_factory=dict)
+    evidence: dict = field(default_factory=dict)
+    change_summary: str = ""

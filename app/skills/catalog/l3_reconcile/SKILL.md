@@ -9,6 +9,16 @@ intent_keywords:
   - reconcile
 risk_level: high
 enabled: true
+capabilities:
+  - reconcile
+  - many_to_one_aggregate
+preconditions:
+  - has_two_tables
+  - has_amount_and_key_columns
+hook_templates:
+  - approve_high_risk_reconcile
+  - set_tolerance
+output_schema: dataframe+audit
 ---
 
 # L3 Reconcile

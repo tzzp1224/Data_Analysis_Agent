@@ -13,7 +13,7 @@
 
 建议开场 30 秒先讲这三点：
 
-1. 这是一个 **Skill-first + Workflow-fallback** 的企业数据分析 Agent 系统，不是纯 prompt demo。  
+1. 这是一个 **Supervisor v2 + Agent-first fallback** 的企业数据分析 Agent 系统，不是纯 prompt demo。  
 2. 系统把“可用性”和“可评估性”同时做了：在线可执行，离线可回归。  
 3. 当前版本重点解决了三件事：
    - 语义契约共享（减少判定漂移）
@@ -40,9 +40,9 @@
 1. API 入口：`app/server.py`
 2. 自动摄取：`app/services/ingestion.py`
 3. 语义契约：`app/services/semantic_contract.py`
-4. 路由与执行：`app/skills/router.py` + `app/skills/engine.py`
-5. 命中 skill（L1/L2/L3/L4）优先执行；未命中走 `app/services/workflow.py`
-6. workflow 代码通过 `app/services/trusted_exec.py` 沙箱执行
+4. 路由与执行：`app/orchestration/agent_first_graph.py` + `app/skills/engine.py`
+5. 每个 step 默认先走 `agent_worker`；重试耗尽后可切确定性 skill 兜底
+6. agent 代码通过 `app/services/trusted_exec.py` 沙箱执行
 7. 结果与审计统一导出：`app/services/exporter.py`
 
 一句话总结：
@@ -50,9 +50,9 @@
 
 ## 2.3 第 5-6 分钟：核心设计亮点
 
-1. **Skill-first 稳定性设计**  
-   - 路由规则：`app/skills/router.py`（L1/L2/L3/L4关键词）
-   - 调度中心：`app/skills/engine.py`
+1. **Agent-first + Deterministic fallback 设计**  
+   - 多步调度中心：`app/orchestration/agent_first_graph.py`
+   - 确定性执行中心：`app/skills/engine.py`
 
 2. **语义契约共享**  
    - `ensure_semantic_contract` 在请求内复用语义推断，减少重复推断和结果漂移（`app/services/semantic_contract.py`）
@@ -95,9 +95,9 @@
    - 刷新语义契约缓存（`invalidate_semantic_contract`）
 2. `/chat`：
    - `ensure_semantic_contract`
-   - `route_skill` 判定
-   - `execute_skill` 调用对应技能
-   - 未命中则 `workflow_app.stream`
+   - supervisor 先生成全局 `plan_steps`
+   - 每步先 dispatch 到 `agent_worker`
+   - agent 重试耗尽时再切到确定性 worker（若配置了 fallback）
 3. 执行结束后统一 `build_export_response` 导出
 
 ## 3.2 L1/L2 深挖
@@ -286,7 +286,7 @@ curl -s -X POST "http://localhost:8000/chat" \
 
 1. 先跑 `run_evaluation.py`
 2. 打开 `golden_dataset/scorecard_latest.csv`
-3. 快速讲三点：skill-first、语义契约、列守卫
+3. 快速讲三点：Agent-first fallback、语义契约、列守卫
 
 ---
 
@@ -294,11 +294,11 @@ curl -s -X POST "http://localhost:8000/chat" \
 
 ## Q1：你的系统核心架构是什么？
 
-A：核心是 skill-first。`/chat` 先 `ensure_semantic_contract`，再 `route_skill`，命中就走 `execute_skill` 的确定性链路；未命中才进 `workflow` 自由代码生成链路。入口都在 `app/server.py`。
+A：核心是 Supervisor v2 的多步编排。`/chat` 先 `ensure_semantic_contract`，再由 supervisor 生成计划并逐步执行；每步默认先走 `agent_worker`，重试耗尽后可切确定性 skill 兜底。入口在 `app/server.py`。
 
-## Q2：为什么要 skill-first，而不是完全依赖 LLM 生成代码？
+## Q2：为什么要 Agent-first + deterministic fallback，而不是完全依赖 LLM 生成代码？
 
-A：为了稳定性和可回归性。确定性 skill 在评测中更可控，失败模式可定位。通用 workflow 仍保留作为覆盖长尾需求的 fallback。
+A：当前是 Agent-first + deterministic fallback。先让 agent 覆盖泛化场景，再在失败时切确定性 skill 保证稳定性和可回归性，两者兼顾。
 
 ## Q3：语义契约解决了什么问题？
 
